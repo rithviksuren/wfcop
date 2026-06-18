@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import secrets
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import (
@@ -13,6 +16,7 @@ from .models import (
     WorkflowSummary,
     WorkflowVisibility,
     WorkflowRun,
+    WorkflowTask,
 )
 
 
@@ -88,6 +92,49 @@ class WorkflowRepository:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workflow_tasks (
+                    id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(workflow_id) REFERENCES workflows(id),
+                    FOREIGN KEY(run_id) REFERENCES workflow_runs(id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS integrations (
+                    provider TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auth_sessions (
+                    token TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES team_members(id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS oauth_states (
+                    state TEXT PRIMARY KEY,
+                    nonce TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                )
+                """
+            )
 
     def save(self, workflow: Workflow) -> Workflow:
         payload = workflow.model_dump_json(by_alias=True)
@@ -119,6 +166,18 @@ class WorkflowRepository:
         if row is None:
             return None
         return Workflow.model_validate_json(row["payload"])
+
+    def delete(self, workflow_id: str) -> bool:
+        with self._connect() as connection:
+            exists = connection.execute("SELECT 1 FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
+            if exists is None:
+                return False
+            connection.execute("DELETE FROM workflow_tasks WHERE workflow_id = ?", (workflow_id,))
+            connection.execute("DELETE FROM workflow_runs WHERE workflow_id = ?", (workflow_id,))
+            connection.execute("DELETE FROM workflow_member_permissions WHERE workflow_id = ?", (workflow_id,))
+            connection.execute("DELETE FROM workflow_team_shares WHERE workflow_id = ?", (workflow_id,))
+            connection.execute("DELETE FROM workflows WHERE id = ?", (workflow_id,))
+        return True
 
     def list(self, user_id: str | None = None) -> list[WorkflowSummary]:
         with self._connect() as connection:
@@ -155,6 +214,7 @@ class WorkflowRepository:
             if existing:
                 current = TeamMember.model_validate_json(existing["payload"])
                 current.name = member.name
+                current.picture = member.picture
                 current.role = member.role
                 member = current
             connection.execute(
@@ -191,6 +251,13 @@ class WorkflowRepository:
         if row is None:
             return None
         return TeamMember.model_validate_json(row["payload"])
+
+    def get_member_by_email(self, email: str) -> TeamMember | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM team_members WHERE email = ?", (email,)
+            ).fetchone()
+        return TeamMember.model_validate_json(row["payload"]) if row else None
 
     def update_member_role(self, user_id: str, role: TeamRole) -> TeamMember | None:
         member = self.get_member(user_id)
@@ -325,3 +392,121 @@ class WorkflowRepository:
         if row is None:
             return None
         return WorkflowRun.model_validate_json(row["payload"])
+
+    def save_task(self, task: WorkflowTask) -> WorkflowTask:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO workflow_tasks (id, workflow_id, run_id, status, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task.id,
+                    task.workflow_id,
+                    task.run_id,
+                    task.status,
+                    task.model_dump_json(),
+                    task.created_at.isoformat(),
+                ),
+            )
+        return task
+
+    def list_tasks(self, workflow_id: str | None = None) -> list[WorkflowTask]:
+        query = "SELECT payload FROM workflow_tasks"
+        params: tuple[str, ...] = ()
+        if workflow_id:
+            query += " WHERE workflow_id = ?"
+            params = (workflow_id,)
+        query += " ORDER BY created_at DESC"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [WorkflowTask.model_validate_json(row["payload"]) for row in rows]
+
+    def save_integration(self, provider: str, config: dict[str, str]) -> datetime:
+        updated_at = datetime.now(timezone.utc)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO integrations (provider, payload, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(provider) DO UPDATE SET
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (provider, json.dumps(config), updated_at.isoformat()),
+            )
+        return updated_at
+
+    def get_integration(self, provider: str) -> dict[str, str]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM integrations WHERE provider = ?", (provider,)
+            ).fetchone()
+        if row is None:
+            return {}
+        payload = json.loads(row["payload"])
+        return {str(key): str(value) for key, value in payload.items()}
+
+    def integration_updated_at(self, provider: str) -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT updated_at FROM integrations WHERE provider = ?", (provider,)
+            ).fetchone()
+        return datetime.fromisoformat(row["updated_at"]) if row else None
+
+    def delete_integration(self, provider: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute("DELETE FROM integrations WHERE provider = ?", (provider,))
+        return cursor.rowcount > 0
+
+    def save_oauth_state(self, state: str, nonce: str, ttl_minutes: int = 10) -> None:
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO oauth_states (state, nonce, expires_at) VALUES (?, ?, ?)",
+                (state, nonce, expires_at.isoformat()),
+            )
+
+    def consume_oauth_state(self, state: str) -> str | None:
+        now = datetime.now(timezone.utc)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT nonce, expires_at FROM oauth_states WHERE state = ?", (state,)
+            ).fetchone()
+            connection.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+        if row is None or datetime.fromisoformat(row["expires_at"]) <= now:
+            return None
+        return str(row["nonce"])
+
+    def create_session(self, user_id: str, ttl_days: int = 14) -> str:
+        token = secrets.token_urlsafe(48)
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(days=ttl_days)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO auth_sessions (token, user_id, expires_at, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (token, user_id, expires_at.isoformat(), now.isoformat()),
+            )
+        return token
+
+    def user_for_session(self, token: str | None) -> TeamMember | None:
+        if not token:
+            return None
+        now = datetime.now(timezone.utc)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT user_id, expires_at FROM auth_sessions WHERE token = ?", (token,)
+            ).fetchone()
+            if row and datetime.fromisoformat(row["expires_at"]) <= now:
+                connection.execute("DELETE FROM auth_sessions WHERE token = ?", (token,))
+                row = None
+        return self.get_member(row["user_id"]) if row else None
+
+    def delete_session(self, token: str | None) -> None:
+        if not token:
+            return
+        with self._connect() as connection:
+            connection.execute("DELETE FROM auth_sessions WHERE token = ?", (token,))

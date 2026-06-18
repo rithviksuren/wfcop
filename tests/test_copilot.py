@@ -101,3 +101,89 @@ def test_fallback_understands_calendar_reminder_workflows():
 
     workflow = Workflow.model_validate(result["workflow"])
     assert [node.type for node in workflow.nodes] == ["calendar_event_trigger", "reminder_create"]
+
+
+def test_jobs_email_instruction_generates_precise_scheduled_workflow(tmp_path):
+    service = build_service(tmp_path)
+
+    response = service.create(
+        'Every morning, check my inbox for emails with word "Jobs" and create a task in our task list.'
+    )
+
+    workflow = response.workflow
+    assert [node.type for node in workflow.nodes] == [
+        "gmail_trigger",
+        "filter_condition",
+        "task_create",
+    ]
+    assert workflow.mode == "scheduled"
+    assert workflow.trigger_schedule == "daily at 09:00"
+    assert workflow.status == "active"
+    assert workflow.nodes[0].config["search_text"] == "Jobs"
+    assert workflow.nodes[1].config == {
+        "field": "email_text",
+        "operator": "contains",
+        "value": "Jobs",
+    }
+    assert workflow.nodes[2].config["title_template"] == "Email follow-up: {{subject}}"
+    assert "Jobs" in workflow.name
+
+
+def test_service_repairs_incomplete_ai_workflow(tmp_path):
+    class IncompleteProvider(LLMProvider):
+        name = "incomplete-ai"
+
+        def generate(self, task: str, payload: dict[str, Any]) -> dict[str, Any]:
+            workflow = Workflow(
+                name="Gmail Trigger -> Task Create",
+                nodes=[
+                    WorkflowNode(id="a", type="gmail_trigger", config={"from_contains": "any sender"}),
+                    WorkflowNode(
+                        id="b",
+                        type="task_create",
+                        config={"list_id": "default", "title_template": "Follow up on urgent email"},
+                    ),
+                ],
+                edges=[WorkflowEdge(from_="a", to="b")],
+            )
+            return {"workflow": workflow.model_dump(by_alias=True), "provider": self.name}
+
+    service = CopilotService(
+        provider=IncompleteProvider(),
+        repository=WorkflowRepository(str(tmp_path / "repaired.sqlite3")),
+    )
+
+    response = service.create(
+        'Every morning, check my inbox for emails with word "Jobs" and create a task in our task list.'
+    )
+
+    assert [node.type for node in response.workflow.nodes] == [
+        "gmail_trigger",
+        "filter_condition",
+        "task_create",
+    ]
+    assert response.workflow.nodes[1].config["value"] == "Jobs"
+    assert response.provider == "incomplete-ai"
+
+
+def test_jobs_filter_matches_subject_or_body_and_uses_subject_for_task(tmp_path):
+    service = build_service(tmp_path)
+    created = service.create(
+        'Every morning, check my inbox for emails with word "Jobs" and create a task in our task list.'
+    )
+
+    run = service.run_workflow(
+        created.workflow,
+        input_payload={
+            "email": {
+                "from": "alerts@example.com",
+                "subject": "New Jobs for Python developers",
+                "body": "Here are today’s openings.",
+            }
+        },
+    )
+
+    assert run.status == "success"
+    assert len(run.steps) == 3
+    assert run.steps[1].output["condition"]["matched"] is True
+    assert run.steps[2].output["created_task"]["title"] == "Email follow-up: New Jobs for Python developers"

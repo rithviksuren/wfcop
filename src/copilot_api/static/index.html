@@ -3,11 +3,45 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#8b3ff4" />
     <title>FlowMind</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <link rel="shortcut icon" href="/favicon.ico" />
+    <link rel="manifest" href="/static/site.webmanifest" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <div class="app-shell">
+    <section class="login-screen" id="login-screen">
+      <div class="login-glow login-glow-one"></div>
+      <div class="login-glow login-glow-two"></div>
+      <div class="login-card">
+        <div class="login-brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 10-13h-7l1-7Z" /></svg>
+          </div>
+          <span>FlowMind</span>
+        </div>
+        <div class="login-copy">
+          <span class="login-eyebrow">Workflow automation, made clear</span>
+          <h1>Turn ideas into workflows that run.</h1>
+          <p>Build, connect, and manage your automations from one calm workspace.</p>
+        </div>
+        <a class="google-signin-button" id="google-signin-button" href="/auth/google/start">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path fill="#4285F4" d="M21.6 12.2c0-.7-.1-1.4-.2-2H12v3.8h5.4a4.6 4.6 0 0 1-2 3v2.5h3.2c1.9-1.8 3-4.3 3-7.3Z"/>
+            <path fill="#34A853" d="M12 22c2.7 0 5-.9 6.6-2.5L15.4 17c-.9.6-2 1-3.4 1a5.8 5.8 0 0 1-5.5-4H3.2v2.6A10 10 0 0 0 12 22Z"/>
+            <path fill="#FBBC05" d="M6.5 14a6 6 0 0 1 0-4V7.4H3.2a10 10 0 0 0 0 9.2L6.5 14Z"/>
+            <path fill="#EA4335" d="M12 6c1.5 0 2.8.5 3.8 1.5l2.9-2.8A9.7 9.7 0 0 0 3.2 7.4L6.5 10A5.8 5.8 0 0 1 12 6Z"/>
+          </svg>
+          <span>Continue with Google</span>
+        </a>
+        <p class="login-setup hidden" id="login-setup"></p>
+        <p class="login-error hidden" id="login-error"></p>
+        <p class="login-terms">By continuing, you agree to use FlowMind with your Google account.</p>
+      </div>
+    </section>
+
+    <div class="app-shell hidden" id="app-shell">
       <aside class="sidebar">
         <div class="brand">
           <div class="brand-mark" aria-hidden="true">
@@ -25,9 +59,17 @@
             <svg viewBox="0 0 24 24"><path d="M12 8v5l3 2M21 12a9 9 0 1 1-3-6.7" /></svg>
             <span>Run History</span>
           </button>
+          <button class="nav-item" type="button" data-view="tasks">
+            <svg viewBox="0 0 24 24"><path d="M9 11l2 2 4-4M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2ZM7 17h10" /></svg>
+            <span>Tasks</span>
+          </button>
           <button class="nav-item" type="button" data-view="team">
             <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8" /></svg>
             <span>Team</span>
+          </button>
+          <button class="nav-item" type="button" data-view="integrations">
+            <svg viewBox="0 0 24 24"><path d="M8 12h8M12 8v8M7 3v4M17 3v4M7 17v4M17 17v4M5 7h14a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z" /></svg>
+            <span>Integrations</span>
           </button>
         </nav>
 
@@ -51,6 +93,15 @@
               <span>New Workflow</span>
             </button>
           </div>
+          <div class="user-menu hidden" id="user-menu">
+            <img class="user-avatar-image hidden" id="user-avatar-image" alt="" />
+            <div class="user-avatar-fallback" id="user-avatar-fallback">U</div>
+            <div class="user-copy">
+              <span id="user-name">User</span>
+              <small id="user-email"></small>
+            </div>
+            <button class="logout-button" type="button" id="logout-button">Sign out</button>
+          </div>
         </header>
 
         <section class="view active" id="view-workflows" aria-label="Workflows">
@@ -71,6 +122,10 @@
 
         <section class="view" id="view-history" aria-label="Run history">
           <div class="content-area" id="history-content"></div>
+        </section>
+
+        <section class="view" id="view-tasks" aria-label="Tasks">
+          <div class="content-area" id="tasks-content"></div>
         </section>
 
         <section class="view" id="view-team" aria-label="Team">
@@ -111,6 +166,19 @@
           </div>
         </section>
 
+        <section class="view" id="view-integrations" aria-label="Integrations">
+          <div class="integrations-wrap">
+            <div class="integrations-intro">
+              <div>
+                <h2>Connect your apps</h2>
+                <p>Add the credentials FlowMind needs to execute workflow steps. Secrets are never displayed again after saving.</p>
+              </div>
+              <span class="security-note">Stored locally</span>
+            </div>
+            <div class="integration-grid" id="integration-grid"></div>
+          </div>
+        </section>
+
         <section class="view" id="view-detail" aria-label="Workflow detail">
           <div class="detail-layout">
             <div class="canvas-panel">
@@ -148,15 +216,17 @@
       <form class="create-card" id="create-form">
         <div class="modal-header">
           <div>
-            <h2 id="create-title">Create with AI</h2>
-            <p>Describe the workflow your team needs.</p>
+            <h2 id="create-title">Plan with FlowMind AI</h2>
+            <p>Describe the outcome. FlowMind will analyze and recommend a workflow before building anything.</p>
           </div>
           <button class="icon-button" type="button" id="close-create" title="Close" aria-label="Close">
             <svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12" /></svg>
           </button>
         </div>
-        <textarea id="workflow-prompt" rows="6" required>Every morning, check my inbox for emails tagged urgent and create a task in our task list.</textarea>
-        <div class="schedule-grid">
+        <div id="workflow-input-panel">
+          <textarea id="workflow-prompt" rows="6" required>Whenever a customer fills a form, create a Jira ticket, notify Slack, update CRM and send a follow-up email.</textarea>
+        </div>
+        <div class="schedule-grid" id="workflow-options">
           <label>
             <span>Mode</span>
             <select id="workflow-mode">
@@ -174,11 +244,70 @@
             </select>
           </label>
         </div>
+        <div class="analysis-review hidden" id="analysis-review">
+          <div class="analysis-banner">
+            <div class="analysis-check">✓</div>
+            <div>
+              <strong>Request understood</strong>
+              <p>No workflow has been created yet. Review the plan before building.</p>
+            </div>
+          </div>
+
+          <section class="analysis-section">
+            <div class="analysis-section-heading">
+              <span>1</span>
+              <div>
+                <h3>Extracted request</h3>
+                <p>Structured directly from your description.</p>
+              </div>
+            </div>
+            <div class="extraction-grid">
+              <div><small>Trigger</small><strong id="analysis-trigger"></strong></div>
+              <div><small>Goal</small><strong id="analysis-goal"></strong></div>
+            </div>
+            <div class="analysis-task-list" id="analysis-tasks"></div>
+          </section>
+
+          <section class="analysis-section">
+            <div class="analysis-section-heading">
+              <span>2</span>
+              <div>
+                <h3>Intent understanding</h3>
+                <p>Business context used to select the right workflow pattern.</p>
+              </div>
+            </div>
+            <div class="intent-grid" id="intent-grid"></div>
+          </section>
+
+          <section class="analysis-section">
+            <div class="analysis-section-heading">
+              <span>3</span>
+              <div>
+                <h3>Recommended proven workflows</h3>
+                <p>Retrieved from FlowMind's workflow knowledge base.</p>
+              </div>
+            </div>
+            <div class="recommendation-list" id="recommendation-list"></div>
+          </section>
+
+          <section class="analysis-section">
+            <div class="analysis-section-heading">
+              <span>4</span>
+              <div>
+                <h3>Proposed workflow</h3>
+                <p>The workflow that will be created after approval.</p>
+              </div>
+            </div>
+            <div class="proposed-step-list" id="proposed-step-list"></div>
+            <div class="integration-warning hidden" id="analysis-integrations"></div>
+          </section>
+        </div>
         <div class="modal-actions">
+          <button class="ghost-button hidden" type="button" id="edit-analysis">Edit request</button>
           <button class="ghost-button" type="button" id="cancel-create">Cancel</button>
           <button class="primary-button" type="submit" id="create-submit">
             <svg viewBox="0 0 24 24"><path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3ZM5 15l.9 2.1L8 18l-2.1.9L5 21l-.9-2.1L2 18l2.1-.9L5 15ZM19 14l.8 1.7 1.7.8-1.7.8L19 19l-.8-1.7-1.7-.8 1.7-.8L19 14Z" /></svg>
-            <span>Create Workflow</span>
+            <span>Analyze Request</span>
           </button>
         </div>
       </form>

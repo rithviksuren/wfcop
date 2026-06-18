@@ -6,6 +6,9 @@ from typing import Any
 
 from .catalog import NODE_CATALOG
 from .diff import diff_workflows
+from .executor import WorkflowExecutionError, WorkflowExecutor
+from .intent import enforce_workflow_intent
+from .intelligence import WorkflowIntelligenceEngine
 from .llm import LLMError, LLMProvider
 from .models import (
     CopilotResponse,
@@ -13,6 +16,7 @@ from .models import (
     UpdateWorkflowRequest,
     ValidationErrorDetail,
     Workflow,
+    WorkflowAnalysisResponse,
     WorkflowRun,
     WorkflowRunStep,
 )
@@ -24,12 +28,47 @@ class CopilotService:
     def __init__(self, provider: LLMProvider, repository: WorkflowRepository, max_attempts: int = 2) -> None:
         self.provider = provider
         self.repository = repository
+        self.executor = WorkflowExecutor(repository)
+        self.intelligence = WorkflowIntelligenceEngine(repository)
         self.max_attempts = max_attempts
+
+    def analyze(self, instruction: str) -> WorkflowAnalysisResponse:
+        return self.intelligence.analyze(instruction)
+
+    def build_analyzed_workflow(
+        self,
+        workflow: Workflow,
+        user_id: str | None = None,
+    ) -> Workflow:
+        now = datetime.now(timezone.utc)
+        workflow.id = Workflow().id
+        workflow.version = 1
+        workflow.created_at = now
+        workflow.updated_at = now
+        workflow.owner_id = user_id
+        workflow.created_by = user_id
+        workflow.updated_by = user_id
+        self._prepare_for_canvas(workflow)
+        validation = validate_workflow(workflow)
+        if not validation.valid:
+            messages = "; ".join(error.message for error in validation.errors)
+            raise ValueError(messages)
+        return self.repository.save(workflow)
+
+    def repair_legacy_workflow(self, workflow: Workflow) -> Workflow:
+        if self.intelligence.repair_legacy_email_workflow(workflow):
+            workflow.version += 1
+            workflow.updated_at = datetime.now(timezone.utc)
+            self._prepare_for_canvas(workflow)
+            self.repository.save(workflow)
+        return workflow
 
     def create(
         self, instruction: str, context: dict[str, Any] | None = None, user_id: str | None = None
     ) -> CopilotResponse:
         result = self._generate_valid_workflow("create", {"instruction": instruction, "context": context or {}})
+        result.workflow = enforce_workflow_intent(result.workflow, instruction)
+        result.validation = validate_workflow(result.workflow)
         self._prepare_for_canvas(result.workflow)
         if user_id:
             result.workflow.owner_id = user_id
@@ -132,9 +171,11 @@ class CopilotService:
         trigger_type: RunTriggerType = "manual",
         input_payload: dict[str, Any] | None = None,
     ) -> WorkflowRun:
+        workflow = self.repair_legacy_workflow(workflow)
         self._prepare_for_canvas(workflow)
         started_at = datetime.now(timezone.utc)
         run = WorkflowRun(workflow_id=workflow.id, trigger_type=trigger_type, status="running", started_at=started_at)
+        self.repository.save_run(run)
         step_input = input_payload or {}
         steps: list[WorkflowRunStep] = []
 
@@ -155,22 +196,45 @@ class CopilotService:
                 run.status = "failed"
                 break
 
-            output = {
-                "message": f"{label} completed.",
-                "node_type": node.type,
-                "sequence": index,
-            }
-            step = WorkflowRunStep(
-                step_id=node.id,
-                label=label,
-                status="success",
-                started_at=step_started,
-                completed_at=datetime.now(timezone.utc),
-                input=step_input,
-                output=output,
-            )
-            steps.append(step)
-            step_input = output
+            try:
+                execution = self.executor.execute(
+                    node,
+                    step_input,
+                    workflow_id=workflow.id,
+                    run_id=run.id,
+                )
+                output = {
+                    **execution.output,
+                    "node_type": node.type,
+                    "sequence": index,
+                }
+                step = WorkflowRunStep(
+                    step_id=node.id,
+                    label=label,
+                    status="success",
+                    started_at=step_started,
+                    completed_at=datetime.now(timezone.utc),
+                    input=step_input,
+                    output=output,
+                )
+                steps.append(step)
+                step_input = output
+                if not execution.continue_workflow:
+                    break
+            except WorkflowExecutionError as exc:
+                steps.append(
+                    WorkflowRunStep(
+                        step_id=node.id,
+                        label=label,
+                        status="failed",
+                        started_at=step_started,
+                        completed_at=datetime.now(timezone.utc),
+                        input=step_input,
+                        error=str(exc),
+                    )
+                )
+                run.status = "failed"
+                break
 
         completed_at = datetime.now(timezone.utc)
         if run.status != "failed":
@@ -179,7 +243,12 @@ class CopilotService:
         run.duration_ms = max(1, int((completed_at - started_at).total_seconds() * 1000))
         run.steps = steps
         succeeded = sum(1 for step in steps if step.status == "success")
-        run.summary = f"{succeeded} of {len(workflow.nodes)} steps completed successfully."
+        if run.status == "failed":
+            run.summary = f"The workflow could not finish. {steps[-1].error}"
+        elif len(steps) < len(workflow.nodes):
+            run.summary = f"No action was taken because {steps[-1].label} did not match."
+        else:
+            run.summary = f"Workflow completed successfully. {succeeded} steps ran."
         self.repository.save_run(run)
         return run
 
@@ -201,7 +270,7 @@ class CopilotService:
                     workflow=workflow,
                     validation=validation,
                     explanation=raw.get("explanation"),
-                    provider=self.provider.name,
+                    provider=raw.get("provider", self.provider.name),
                 )
             current_payload = {
                 **payload,

@@ -42,7 +42,14 @@ class OpenAIProvider(LLMProvider):
                     "role": "system",
                     "content": (
                         "You are an AI workflow copilot. Return only valid JSON. "
-                        "Use the provided node catalog and produce workflows that pass validation. "
+                        "Use the provided node catalog and preserve every explicit requirement in the instruction. "
+                        "A phrase such as 'emails with word X', 'containing X', or 'contains X' requires a "
+                        "filter_condition with field=email_text, operator=contains, and value=X; never omit it. "
+                        "For email text filters, also set gmail_trigger.search_text to X. "
+                        "Time phrases must configure workflow mode and trigger_schedule: every morning means "
+                        "mode=scheduled and trigger_schedule='daily at 09:00'. "
+                        "Task titles should use relevant event data, such as 'Email follow-up: {{subject}}', "
+                        "instead of unrelated generic text. Produce a clear, specific workflow name and labels. "
                         "The response shape must be {\"workflow\": {...}, \"explanation\": string}."
                     ),
                 },
@@ -56,7 +63,18 @@ class OpenAIProvider(LLMProvider):
                             "workflow_schema": {
                                 "id": "string",
                                 "name": "string",
-                                "nodes": [{"id": "string", "type": "string", "config": {}}],
+                                "status": "draft|active|paused",
+                                "mode": "manual|scheduled",
+                                "trigger_schedule": "string|null",
+                                "nodes": [
+                                    {
+                                        "id": "string",
+                                        "type": "string",
+                                        "label": "specific human-readable label",
+                                        "description": "specific human-readable description",
+                                        "config": {},
+                                    }
+                                ],
                                 "edges": [{"from": "string", "to": "string"}],
                             },
                         },
@@ -136,7 +154,10 @@ class HeuristicProvider(LLMProvider):
         nodes = self._nodes_for_instruction(instruction)
         if not nodes:
             nodes = [self._node("webhook", "node_1")]
-        return self._linear_workflow("Generated workflow", nodes)
+        workflow = self._linear_workflow("Generated workflow", nodes)
+        from .intent import enforce_workflow_intent
+
+        return enforce_workflow_intent(workflow, instruction)
 
     def _modify(self, workflow: Workflow, instruction: str) -> Workflow:
         updated = deepcopy(workflow)
@@ -181,7 +202,10 @@ class HeuristicProvider(LLMProvider):
         if any(term in text for term in ("email", "gmail", "stripe")):
             sender = "Stripe" if "stripe" in text else "any sender"
             nodes.append(self._node("gmail_trigger", f"node_{len(nodes) + 1}", {"from_contains": sender}))
-        if any(term in text for term in ("urgent", "tagged", "only if", "when tag")):
+        if any(
+            term in text
+            for term in ("urgent", "tagged", "only if", "when tag", "with word", "containing", "contains")
+        ) or re.search(r"""["'][^"']+["']""", instruction):
             nodes.append(self._node("filter_condition", f"node_{len(nodes) + 1}"))
         if "webhook" in text or "http" in text:
             nodes.append(self._node("webhook", f"node_{len(nodes) + 1}"))

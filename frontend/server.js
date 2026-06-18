@@ -34,6 +34,7 @@ const contentTypes = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
   ".png": "image/png",
   ".svg": "image/svg+xml",
 };
@@ -55,7 +56,12 @@ function sendFile(response, filePath) {
 }
 
 function proxyToBackend(request, response) {
-  const headers = { ...request.headers, host: `${backendHost}:${backendPort}` };
+  const headers = {
+    ...request.headers,
+    host: `${backendHost}:${backendPort}`,
+    "x-forwarded-host": request.headers.host,
+    "x-forwarded-proto": "http",
+  };
   delete headers.connection;
 
   const proxyRequest = http.request(
@@ -105,8 +111,7 @@ const server = http.createServer((request, response) => {
   }
 
   if (requestUrl.pathname === "/favicon.ico") {
-    response.writeHead(204);
-    response.end();
+    sendFile(response, path.join(staticRoot, "favicon.svg"));
     return;
   }
 

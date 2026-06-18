@@ -1,0 +1,16 @@
+{
+  "name": "FlowMind",
+  "short_name": "FlowMind",
+  "description": "AI-powered workflow automation",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b1017",
+  "theme_color": "#8b3ff4",
+  "icons": [
+    {
+      "src": "/static/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

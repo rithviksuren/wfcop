@@ -16,6 +16,23 @@ TeamRole = Literal["admin", "member"]
 WorkflowPermission = Literal["run", "edit_run"]
 RunStatus = Literal["pending", "running", "success", "failed"]
 RunTriggerType = Literal["manual", "scheduled"]
+IntegrationProvider = Literal[
+    "gmail",
+    "slack",
+    "teams",
+    "notion",
+    "jira",
+    "hubspot",
+    "google_calendar",
+    "google_drive",
+    "google_sheets",
+    "github",
+    "discord",
+    "airtable",
+    "stripe",
+    "salesforce",
+]
+WorkflowPriority = Literal["low", "medium", "high"]
 
 
 class WorkflowNode(BaseModel):
@@ -87,6 +104,54 @@ class CreateWorkflowRequest(BaseModel):
     context: dict[str, Any] = Field(default_factory=dict)
 
 
+class ExtractedWorkflowRequest(BaseModel):
+    trigger: str
+    tasks: list[str] = Field(default_factory=list)
+    goal: str
+
+
+class WorkflowIntentProfile(BaseModel):
+    industry: str
+    workflow_type: str
+    priority: WorkflowPriority = "medium"
+    apps: list[str] = Field(default_factory=list)
+
+
+class WorkflowRecommendation(BaseModel):
+    id: str
+    name: str
+    description: str
+    match_score: float
+    reason: str
+    apps: list[str] = Field(default_factory=list)
+    steps: list[str] = Field(default_factory=list)
+
+
+class RetrievalContext(BaseModel):
+    query: str
+    knowledge_base: str = "flowmind-proven-workflows"
+    retrieved_template_ids: list[str] = Field(default_factory=list)
+    guidance: list[str] = Field(default_factory=list)
+
+
+class WorkflowAnalysisResponse(BaseModel):
+    instruction: str
+    extracted: ExtractedWorkflowRequest
+    intent: WorkflowIntentProfile
+    recommendations: list[WorkflowRecommendation] = Field(default_factory=list)
+    retrieval: RetrievalContext
+    proposed_workflow: Workflow
+    required_apps: list[str] = Field(default_factory=list)
+    missing_integrations: list[str] = Field(default_factory=list)
+    provider: str = "hybrid-rag"
+
+
+class BuildWorkflowRequest(BaseModel):
+    instruction: str
+    workflow: Workflow
+    selected_recommendation_id: str | None = None
+
+
 class ModifyWorkflowRequest(BaseModel):
     workflow: Workflow
     instruction: str
@@ -139,6 +204,7 @@ class TeamMember(BaseModel):
     id: str = Field(default_factory=lambda: f"user_{uuid4().hex[:10]}")
     email: str
     name: str | None = None
+    picture: str | None = None
     role: TeamRole = "member"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -198,3 +264,53 @@ class WorkflowRun(BaseModel):
     duration_ms: int | None = None
     summary: str | None = None
     steps: list[WorkflowRunStep] = Field(default_factory=list)
+
+
+class WorkflowTask(BaseModel):
+    id: str = Field(default_factory=lambda: f"task_{uuid4().hex[:12]}")
+    workflow_id: str
+    run_id: str
+    list_id: str = "default"
+    title: str
+    status: Literal["open", "completed"] = "open"
+    source: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class WorkflowTaskSummary(BaseModel):
+    id: str
+    workflow_id: str
+    run_id: str
+    list_id: str
+    title: str
+    status: Literal["open", "completed"]
+    created_at: datetime
+
+
+class AuthUser(BaseModel):
+    id: str
+    email: str
+    name: str | None = None
+    picture: str | None = None
+    role: TeamRole
+
+
+class AuthStatus(BaseModel):
+    authenticated: bool
+    google_configured: bool
+    user: AuthUser | None = None
+    setup_message: str | None = None
+    oauth_redirect_uri: str | None = None
+
+
+class IntegrationUpdate(BaseModel):
+    config: dict[str, str] = Field(default_factory=dict)
+
+
+class IntegrationSummary(BaseModel):
+    provider: IntegrationProvider
+    name: str
+    connected: bool
+    values: dict[str, str] = Field(default_factory=dict)
+    configured_fields: list[str] = Field(default_factory=list)
+    updated_at: datetime | None = None
