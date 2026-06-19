@@ -69,7 +69,9 @@ INTEGRATIONS = {
     },
     "notion": {
         "name": "Notion",
-        "required": ("api_token", "database_id"),
+        "required": ("api_token",),
+        "optional": ("data_source_id", "database_id", "title_property"),
+        "one_of": (("data_source_id", "database_id"),),
         "secret": ("api_token",),
     },
     "jira": {
@@ -263,18 +265,33 @@ def save_integration(
     _require_admin(x_user_id)
     definition = _integration_definition(provider)
     current = repository.get_integration(provider)
-    allowed_fields = set(definition["required"]) | {"title_property"}
+    allowed_fields = set(definition["required"]) | set(definition.get("optional", ()))
     for field, raw_value in request.config.items():
         if field not in allowed_fields:
             continue
         value = raw_value.strip()
         if value:
             current[field] = value
+    if provider == "notion" and current.get("data_source_id"):
+        try:
+            current["data_source_id"] = WorkflowExecutor.normalize_notion_id(
+                current["data_source_id"],
+                "data source",
+            )
+        except WorkflowExecutionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     missing = [field for field in definition["required"] if not current.get(field)]
-    if missing:
+    missing_groups = [
+        fields
+        for fields in definition.get("one_of", ())
+        if not any(current.get(field) for field in fields)
+    ]
+    if missing or missing_groups:
+        requirements = list(missing)
+        requirements.extend(" or ".join(fields) for fields in missing_groups)
         raise HTTPException(
             status_code=422,
-            detail=f"{definition['name']} requires: {', '.join(missing)}.",
+            detail=f"{definition['name']} requires: {', '.join(requirements)}.",
         )
     if provider == "gmail":
         current["app_password"] = WorkflowExecutor.normalize_gmail_app_password(current["app_password"])
@@ -328,7 +345,11 @@ def build_analyzed_workflow(
     x_user_id: str | None = Header(default=None, alias="X-User-Id"),
 ) -> Workflow:
     try:
-        return copilot.build_analyzed_workflow(request.workflow, user_id=x_user_id)
+        return copilot.build_analyzed_workflow(
+            request.workflow,
+            user_id=x_user_id,
+            instruction=request.instruction,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -343,6 +364,8 @@ def modify_workflow(
         return copilot.modify(request.workflow, request.instruction, request.context, user_id=x_user_id)
     except LLMError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/copilot/fix", response_model=CopilotResponse)
@@ -566,14 +589,17 @@ def _integration_summary(provider: str) -> IntegrationSummary:
     definition = _integration_definition(provider)
     config = repository.get_integration(provider)
     secret_fields = set(definition["secret"])
-    public_fields = set(definition["required"]) | {"title_property"}
+    public_fields = set(definition["required"]) | set(definition.get("optional", ()))
     values = {
         field: value
         for field, value in config.items()
         if field in public_fields and field not in secret_fields
     }
     required = definition["required"]
-    connected = all(config.get(field) for field in required)
+    connected = all(config.get(field) for field in required) and all(
+        any(config.get(field) for field in fields)
+        for fields in definition.get("one_of", ())
+    )
     if provider == "gmail":
         connected = connected and config.get("verified") == "true"
     return IntegrationSummary(

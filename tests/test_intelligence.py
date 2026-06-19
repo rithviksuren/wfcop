@@ -84,6 +84,48 @@ def test_approved_analysis_is_saved_only_after_build(tmp_path):
     assert len(repository.list(user_id="owner")) == 1
 
 
+def test_stripe_email_to_finance_slack_acceptance_requirement(tmp_path):
+    repository = WorkflowRepository(str(tmp_path / "stripe-slack.sqlite3"))
+    service = CopilotService(provider=HeuristicProvider(), repository=repository)
+    instruction = (
+        "When I receive an email from Stripe, "
+        "send a Slack message to the finance team."
+    )
+
+    analysis = service.analyze(instruction)
+
+    assert analysis.extracted.trigger == "I receive an email from Stripe"
+    assert analysis.extracted.tasks == [
+        "Send a Slack message to the finance team",
+    ]
+    assert analysis.unsupported_tasks == []
+    assert [node.type for node in analysis.proposed_workflow.nodes] == [
+        "gmail_trigger",
+        "slack_message",
+    ]
+    gmail, slack = analysis.proposed_workflow.nodes
+    assert gmail.config["from_contains"] == "Stripe"
+    assert slack.config == {
+        "channel_id": "finance",
+        "message_template": "New email from {{from}}: {{subject}}",
+    }
+    assert analysis.proposed_workflow.edges[0].from_ == gmail.id
+    assert analysis.proposed_workflow.edges[0].to == slack.id
+
+    built = service.build_analyzed_workflow(
+        analysis.proposed_workflow,
+        user_id="owner",
+        instruction=instruction,
+    )
+
+    assert built.owner_id == "owner"
+    assert [node.type for node in built.nodes] == [
+        "gmail_trigger",
+        "slack_message",
+    ]
+    assert repository.get(built.id) is not None
+
+
 def test_mail_related_to_topic_becomes_gmail_search_filter_and_task(tmp_path):
     engine, _ = build_engine(tmp_path)
 
@@ -126,3 +168,43 @@ def test_legacy_mail_webhook_is_repaired(tmp_path):
         "task_create",
     ]
     assert workflow.nodes[0].config["search_text"] == "job search"
+
+
+def test_newsletter_email_details_are_copied_to_notion_without_invented_actions(tmp_path):
+    engine, _ = build_engine(tmp_path)
+
+    analysis = engine.analyze(
+        "check email for newletters and add its details to a page in my notion."
+    )
+
+    assert analysis.extracted.trigger == "Check email for newletters"
+    assert analysis.extracted.tasks == [
+        "Add its details to a page in my notion",
+    ]
+    assert analysis.unsupported_tasks == []
+    assert [node.type for node in analysis.proposed_workflow.nodes] == [
+        "gmail_trigger",
+        "filter_condition",
+        "notion_create_page",
+    ]
+    assert analysis.proposed_workflow.nodes[0].config["search_text"] == "newsletter"
+    assert analysis.proposed_workflow.nodes[1].config == {
+        "field": "email_text",
+        "operator": "contains",
+        "value": "newsletter",
+    }
+    notion = analysis.proposed_workflow.nodes[2]
+    assert notion.config["title_template"] == "Email: {{subject}}"
+    assert "{{from}}" in notion.config["content_template"]
+    assert "{{body}}" in notion.config["content_template"]
+
+
+def test_recommendations_do_not_inject_unrequested_template_steps(tmp_path):
+    engine, _ = build_engine(tmp_path)
+
+    analysis = engine.analyze("When an email arrives, archive it in Dropbox.")
+
+    assert analysis.unsupported_tasks == ["Archive it in Dropbox"]
+    assert [node.type for node in analysis.proposed_workflow.nodes] == [
+        "gmail_trigger",
+    ]

@@ -430,10 +430,10 @@ const integrationDefinitions = {
   notion: {
     logo: "https://api.iconify.design/logos:notion-icon.svg",
     description: "Create pages in a Notion database.",
-    help: "Share the target database with your Notion integration.",
+    help: "Share the database with your integration, then open Manage data sources and copy the data source ID.",
     fields: [
       { name: "api_token", label: "Integration token", type: "password", placeholder: "secret_..." },
-      { name: "database_id", label: "Database ID", type: "text", placeholder: "Notion database ID" },
+      { name: "data_source_id", label: "Data source ID", type: "text", placeholder: "UUID or Notion data source URL" },
       { name: "title_property", label: "Title property", type: "text", placeholder: "Name" },
     ],
   },
@@ -1026,7 +1026,7 @@ async function createWorkflow(event) {
   } catch (error) {
     showToast(error.message);
   } finally {
-    submit.disabled = false;
+    submit.disabled = Boolean(state.pendingAnalysis?.unsupported_tasks?.length);
     submit.querySelector("span").textContent = state.pendingAnalysis ? "Build Workflow" : "Analyze Request";
   }
 }
@@ -1088,14 +1088,33 @@ function renderWorkflowAnalysis(analysis) {
     .join("");
 
   const warning = document.querySelector("#analysis-integrations");
-  if (analysis.missing_integrations.length) {
-    warning.innerHTML = `<strong>Connections required before running</strong><p>${escapeHtml(
-      analysis.missing_integrations.join(", ")
-    )}</p>`;
+  const unsupported = analysis.unsupported_tasks || [];
+  const warnings = analysis.planning_warnings || [];
+  if (analysis.missing_integrations.length || unsupported.length || warnings.length) {
+    const messages = [];
+    if (unsupported.length) {
+      messages.push(
+        `<strong>Cannot build unsupported actions</strong><p>${escapeHtml(
+          unsupported.join("; ")
+        )}</p>`
+      );
+    }
+    if (analysis.missing_integrations.length) {
+      messages.push(
+        `<strong>Connections required before running</strong><p>${escapeHtml(
+          analysis.missing_integrations.join(", ")
+        )}</p>`
+      );
+    }
+    if (warnings.length) {
+      messages.push(`<p>${escapeHtml(warnings.join(" "))}</p>`);
+    }
+    warning.innerHTML = messages.join("");
     warning.classList.remove("hidden");
   } else {
     warning.classList.add("hidden");
   }
+  document.querySelector("#create-submit").disabled = unsupported.length > 0;
 }
 
 function resetWorkflowAnalysis() {
@@ -1104,6 +1123,7 @@ function resetWorkflowAnalysis() {
   document.querySelector("#workflow-input-panel").classList.remove("hidden");
   els.analysisReview.classList.add("hidden");
   document.querySelector("#edit-analysis").classList.add("hidden");
+  document.querySelector("#create-submit").disabled = false;
   document.querySelector("#create-submit span").textContent = "Analyze Request";
 }
 

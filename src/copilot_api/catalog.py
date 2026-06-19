@@ -51,9 +51,13 @@ NODE_CATALOG: dict[str, NodeDefinition] = {
     ),
     "notion_create_page": NodeDefinition(
         type="notion_create_page",
-        description="Create a Notion page",
-        required_config=("database_id", "title_template"),
-        defaults={"database_id": "default", "title_template": "New workflow event"},
+        description="Create a Notion page with a title and content",
+        required_config=("title_template",),
+        defaults={
+            "data_source_id": "default",
+            "title_template": "New workflow event",
+            "content_template": "",
+        },
     ),
     "webhook": NodeDefinition(
         type="webhook",

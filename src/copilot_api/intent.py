@@ -35,22 +35,30 @@ def extract_workflow_intent(instruction: str) -> WorkflowIntent:
         intent.filter_operator = "contains"
         intent.filter_value = (quoted or unquoted).group(1).strip()
     elif intent.email_requested:
-        related = re.search(
-            r"\b(?:related to|about|regarding)\s+(.+?)(?:,|\s+and\s+(?:create|send|make|add)\b|$)",
-            text,
-            re.I,
-        )
-        if related:
-            intent.filter_field = "email_text"
-            intent.filter_operator = "contains"
-            intent.filter_value = related.group(1).strip(" .")
-        elif any(
+        if any(
             term in lowered
             for term in ("tagged urgent", "tag urgent", "urgent email", "emails tagged urgent")
         ):
             intent.filter_field = "tag"
             intent.filter_operator = "equals"
             intent.filter_value = "urgent"
+        else:
+            related = re.search(
+                r"\b(?:related to|about|regarding)\s+(.+?)(?:,|\s+and\s+(?:create|send|make|add)\b|$)",
+                text,
+                re.I,
+            )
+            email_for = re.search(
+                r"\b(?:emails?|e-mails?|mail|gmail|inbox)\s+for\s+"
+                r"(?!emails?\b|e-mails?\b|mail\b)(.+?)"
+                r"(?:,|\s+and\s+(?:create|send|make|add|save|copy|store|post)\b|$)",
+                text,
+                re.I,
+            )
+            if related or email_for:
+                intent.filter_field = "email_text"
+                intent.filter_operator = "contains"
+                intent.filter_value = (related or email_for).group(1).strip(" .")
     elif any(term in lowered for term in ("tagged urgent", "tag urgent", "urgent email", "emails tagged urgent")):
         intent.filter_field = "tag"
         intent.filter_operator = "equals"

@@ -143,6 +143,8 @@ class WorkflowAnalysisResponse(BaseModel):
     proposed_workflow: Workflow
     required_apps: list[str] = Field(default_factory=list)
     missing_integrations: list[str] = Field(default_factory=list)
+    unsupported_tasks: list[str] = Field(default_factory=list)
+    planning_warnings: list[str] = Field(default_factory=list)
     provider: str = "hybrid-rag"
 
 

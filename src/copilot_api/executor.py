@@ -30,6 +30,8 @@ class NodeExecution:
 
 
 class WorkflowExecutor:
+    NOTION_API_VERSION = "2025-09-03"
+
     def __init__(self, repository: WorkflowRepository) -> None:
         self.repository = repository
 
@@ -248,28 +250,45 @@ class WorkflowExecutor:
     ) -> NodeExecution:
         integration = self.repository.get_integration("notion")
         token = integration.get("api_token") or os.getenv("NOTION_API_TOKEN")
-        database_id = str(
-            node.config.get("database_id")
-            or integration.get("database_id")
-            or os.getenv("NOTION_DATABASE_ID")
-            or ""
-        )
-        if not token or not database_id or database_id == "default":
+        if not token:
             raise WorkflowExecutionError(
-                "Notion is not configured. Open Integrations and add an API token and database ID."
+                "Notion is not configured. Open Integrations and add an integration token."
             )
+        data_source_id = self._resolve_notion_data_source_id(
+            node,
+            integration,
+            str(token),
+        )
         title = self._render_template(str(node.config.get("title_template", "Workflow event")), payload)
+        content = self._render_template(str(node.config.get("content_template", "")), payload)
         title_property = integration.get("title_property", "Name")
+        request_payload: dict[str, Any] = {
+            "parent": {
+                "type": "data_source_id",
+                "data_source_id": data_source_id,
+            },
+            "properties": {title_property: {"title": [{"text": {"content": title}}]}},
+        }
+        children = self._notion_content_blocks(content)
+        if children:
+            request_payload["children"] = children
         response = self._post_json(
             "https://api.notion.com/v1/pages",
-            {
-                "parent": {"database_id": database_id},
-                "properties": {title_property: {"title": [{"text": {"content": title}}]}},
+            request_payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Notion-Version": self.NOTION_API_VERSION,
             },
-            headers={"Authorization": f"Bearer {token}", "Notion-Version": "2022-06-28"},
         )
         return NodeExecution(
-            output={**payload, "created_page": {"id": response.get("id"), "title": title}}
+            output={
+                **payload,
+                "created_page": {
+                    "id": response.get("id"),
+                    "title": title,
+                    "content": content,
+                },
+            }
         )
 
     def _execute_jira_ticket_create(
@@ -547,6 +566,124 @@ class WorkflowExecutor:
 
         return re.sub(r"\{\{\s*([^}]+)\s*\}\}", replace, template).strip()
 
+    def _notion_content_blocks(self, content: str) -> list[dict[str, Any]]:
+        blocks: list[dict[str, Any]] = []
+        for paragraph in re.split(r"\n\s*\n", content.strip()):
+            clean = paragraph.strip()
+            if not clean:
+                continue
+            for start in range(0, len(clean), 2000):
+                chunk = clean[start : start + 2000]
+                blocks.append(
+                    {
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": [
+                                {
+                                    "type": "text",
+                                    "text": {"content": chunk},
+                                }
+                            ]
+                        },
+                    }
+                )
+        return blocks[:100]
+
+    def _resolve_notion_data_source_id(
+        self,
+        node: WorkflowNode,
+        integration: dict[str, str],
+        token: str,
+    ) -> str:
+        direct_value = (
+            node.config.get("data_source_id")
+            if node.config.get("data_source_id") not in (None, "", "default")
+            else integration.get("data_source_id")
+            or os.getenv("NOTION_DATA_SOURCE_ID")
+        )
+        if direct_value:
+            return self.normalize_notion_id(str(direct_value), "data source")
+
+        legacy_value = (
+            node.config.get("database_id")
+            if node.config.get("database_id") not in (None, "", "default")
+            else integration.get("database_id")
+            or os.getenv("NOTION_DATABASE_ID")
+        )
+        if not legacy_value:
+            raise WorkflowExecutionError(
+                "Notion is not configured. Open Integrations and add the target data source ID."
+            )
+
+        database_id = self.normalize_notion_id(str(legacy_value), "database")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": self.NOTION_API_VERSION,
+        }
+        try:
+            database = self._get_json(
+                f"https://api.notion.com/v1/databases/{database_id}",
+                headers=headers,
+            )
+        except WorkflowExecutionError as database_error:
+            try:
+                self._get_json(
+                    f"https://api.notion.com/v1/data_sources/{database_id}",
+                    headers=headers,
+                )
+                return database_id
+            except WorkflowExecutionError:
+                raise WorkflowExecutionError(
+                    "The saved Notion identifier is not an accessible database or data source. "
+                    "In Notion, open the database settings, choose Manage data sources, copy the "
+                    "data source ID, and save it in Integrations."
+                ) from database_error
+
+        data_sources = database.get("data_sources")
+        if not isinstance(data_sources, list) or not data_sources:
+            raise WorkflowExecutionError(
+                "The Notion database has no accessible data source. Share the database with "
+                "your integration and copy its data source ID."
+            )
+        if len(data_sources) > 1:
+            raise WorkflowExecutionError(
+                "This Notion database has multiple data sources. Open Manage data sources, "
+                "copy the exact data source ID you want, and save it in Integrations."
+            )
+        data_source_id = self.normalize_notion_id(
+            str(data_sources[0].get("id", "")),
+            "data source",
+        )
+        if integration.get("database_id") == legacy_value:
+            migrated = {
+                **integration,
+                "data_source_id": data_source_id,
+            }
+            self.repository.save_integration("notion", migrated)
+        return data_source_id
+
+    @staticmethod
+    def normalize_notion_id(value: str, label: str = "identifier") -> str:
+        clean = value.strip()
+        matches = re.findall(
+            r"(?<![0-9a-fA-F])"
+            r"([0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+            r"(?![0-9a-fA-F])",
+            clean,
+        )
+        if not matches:
+            raise WorkflowExecutionError(
+                f"The Notion {label} is invalid. It must be a Notion ID or URL, not an "
+                "email address or account name."
+            )
+        raw = matches[-1].replace("-", "").lower()
+        return (
+            f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-"
+            f"{raw[16:20]}-{raw[20:]}"
+        )
+
     def _post_json(
         self, url: str, payload: dict[str, Any], headers: dict[str, str] | None = None
     ) -> dict[str, Any]:
@@ -563,5 +700,27 @@ class WorkflowExecutor:
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise WorkflowExecutionError(f"Integration request failed with HTTP {exc.code}: {detail[:300]}") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise WorkflowExecutionError(f"Integration request failed: {exc}") from exc
+
+    def _get_json(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        request = urllib.request.Request(
+            url,
+            headers=headers or {},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                body = response.read().decode("utf-8")
+                return json.loads(body) if body else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise WorkflowExecutionError(
+                f"Integration request failed with HTTP {exc.code}: {detail[:300]}"
+            ) from exc
         except (urllib.error.URLError, TimeoutError) as exc:
             raise WorkflowExecutionError(f"Integration request failed: {exc}") from exc

@@ -22,19 +22,91 @@ def test_create_stripe_to_slack_workflow(tmp_path):
     assert [node.type for node in response.workflow.nodes] == ["gmail_trigger", "slack_message"]
     assert response.workflow.nodes[0].config["from_contains"] == "Stripe"
     assert response.workflow.nodes[1].config["channel_id"] == "finance"
+    assert response.workflow.nodes[1].config["message_template"] == (
+        "New email from {{from}}: {{subject}}"
+    )
     assert response.workflow.edges[0].from_ == response.workflow.nodes[0].id
 
 
 def test_modify_adds_notion_page(tmp_path):
     service = build_service(tmp_path)
     created = service.create("When I receive an email from Stripe, send a Slack message to the finance team.")
+    original_nodes = [node.model_copy(deep=True) for node in created.workflow.nodes]
+    original_edges = [edge.model_copy(deep=True) for edge in created.workflow.edges]
 
     modified = service.modify(created.workflow, "Also create a Notion page whenever an email arrives.")
 
     assert modified.validation.valid
-    assert "notion_create_page" in {node.type for node in modified.workflow.nodes}
-    assert any(operation.op == "add_node" for operation in modified.operations)
-    assert any(edge.to == modified.workflow.nodes[-1].id for edge in modified.workflow.edges)
+    assert [node.type for node in modified.workflow.nodes] == [
+        "gmail_trigger",
+        "slack_message",
+        "notion_create_page",
+    ]
+    assert modified.workflow.nodes[:2] == original_nodes
+    assert original_edges[0] in modified.workflow.edges
+    notion = modified.workflow.nodes[-1]
+    assert notion.config["title_template"] == "Email: {{subject}}"
+    assert "{{body}}" in notion.config["content_template"]
+    assert any(
+        edge.from_ == modified.workflow.nodes[0].id and edge.to == notion.id
+        for edge in modified.workflow.edges
+    )
+    assert [operation.op for operation in modified.operations].count("add_node") == 1
+    assert [operation.op for operation in modified.operations].count("connect_nodes") == 1
+    assert not any(
+        operation.op in {"remove_node", "disconnect_nodes"}
+        for operation in modified.operations
+    )
+    assert modified.workflow.version == created.workflow.version + 1
+
+
+def test_additive_modify_preserves_existing_steps_when_provider_drops_them(tmp_path):
+    class DestructiveModifyProvider(LLMProvider):
+        name = "destructive-modifier"
+
+        def generate(self, task: str, payload: dict[str, Any]) -> dict[str, Any]:
+            if task == "create":
+                return HeuristicProvider().generate(task, payload)
+            workflow = Workflow(
+                name="Notion only",
+                nodes=[
+                    WorkflowNode(
+                        id="replacement",
+                        type="notion_create_page",
+                        config={
+                            "data_source_id": "default",
+                            "title_template": "New page",
+                            "content_template": "",
+                        },
+                    )
+                ],
+            )
+            return {
+                "workflow": workflow.model_dump(by_alias=True),
+                "provider": self.name,
+            }
+
+    service = CopilotService(
+        provider=DestructiveModifyProvider(),
+        repository=WorkflowRepository(str(tmp_path / "safe-modify.sqlite3")),
+    )
+    created = service.create(
+        "When I receive an email from Stripe, send a Slack message to the finance team."
+    )
+
+    modified = service.modify(
+        created.workflow,
+        "Also create a Notion page whenever an email arrives.",
+    )
+
+    assert modified.validation.valid
+    assert [node.type for node in modified.workflow.nodes] == [
+        "gmail_trigger",
+        "slack_message",
+        "notion_create_page",
+    ]
+    assert modified.workflow.nodes[0].config["from_contains"] == "Stripe"
+    assert modified.workflow.nodes[1].config["channel_id"] == "finance"
 
 
 def test_fix_adds_missing_slack_channel(tmp_path):

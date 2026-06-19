@@ -39,7 +39,24 @@ class CopilotService:
         self,
         workflow: Workflow,
         user_id: str | None = None,
+        instruction: str | None = None,
     ) -> Workflow:
+        if instruction:
+            analysis = self.intelligence.analyze(instruction)
+            if analysis.unsupported_tasks:
+                raise ValueError(
+                    "FlowMind cannot build these requested actions yet: "
+                    + "; ".join(analysis.unsupported_tasks)
+                )
+            expected_types = [
+                node.type for node in analysis.proposed_workflow.nodes
+            ]
+            submitted_types = [node.type for node in workflow.nodes]
+            if submitted_types != expected_types:
+                raise ValueError(
+                    "The proposed steps do not match the request. Analyze the request again "
+                    "before building."
+                )
         now = datetime.now(timezone.utc)
         workflow.id = Workflow().id
         workflow.version = 1
@@ -68,6 +85,7 @@ class CopilotService:
     ) -> CopilotResponse:
         result = self._generate_valid_workflow("create", {"instruction": instruction, "context": context or {}})
         result.workflow = enforce_workflow_intent(result.workflow, instruction)
+        result.workflow = self._ground_to_instruction(result.workflow, instruction)
         result.validation = validate_workflow(result.workflow)
         self._prepare_for_canvas(result.workflow)
         if user_id:
@@ -87,6 +105,11 @@ class CopilotService:
         before = deepcopy(workflow)
         payload = {"workflow": workflow.model_dump(by_alias=True), "instruction": instruction, "context": context or {}}
         result = self._generate_valid_workflow("modify", payload)
+        result.workflow = self.intelligence.apply_additive_modification(
+            before,
+            result.workflow,
+            instruction,
+        )
         result.workflow.id = workflow.id
         result.workflow.version = workflow.version + 1
         result.workflow.created_at = workflow.created_at
@@ -99,6 +122,12 @@ class CopilotService:
         result.workflow.mode = workflow.mode
         result.workflow.trigger_schedule = workflow.trigger_schedule
         self._prepare_for_canvas(result.workflow)
+        result.validation = validate_workflow(result.workflow)
+        if not result.validation.valid:
+            messages = "; ".join(
+                error.message for error in result.validation.errors
+            )
+            raise ValueError(messages)
         result.operations = diff_workflows(before, result.workflow)
         self.repository.save(result.workflow)
         return result
@@ -298,3 +327,40 @@ class CopilotService:
             if node.description is None:
                 node.description = definition.description if definition else node.type.replace("_", " ")
             node.status = "idle"
+
+    def _ground_to_instruction(self, workflow: Workflow, instruction: str) -> Workflow:
+        analysis = self.intelligence.analyze(instruction)
+        if analysis.unsupported_tasks or not analysis.extracted.tasks:
+            return workflow
+
+        expected = analysis.proposed_workflow
+        if [node.type for node in workflow.nodes] != [
+            node.type for node in expected.nodes
+        ]:
+            return expected
+
+        for generated_node, expected_node in zip(workflow.nodes, expected.nodes):
+            definition = NODE_CATALOG.get(expected_node.type)
+            defaults = definition.defaults if definition else {}
+            if expected_node.type in {
+                "gmail_trigger",
+                "filter_condition",
+                "notion_create_page",
+            }:
+                explicit_config = expected_node.config
+            else:
+                explicit_config = {
+                    key: value
+                    for key, value in expected_node.config.items()
+                    if defaults.get(key) != value
+                }
+            generated_node.config.update(explicit_config)
+            generated_node.label = expected_node.label
+            generated_node.description = expected_node.description
+
+        workflow.name = expected.name
+        if expected.mode == "scheduled":
+            workflow.mode = expected.mode
+            workflow.trigger_schedule = expected.trigger_schedule
+            workflow.status = expected.status
+        return workflow

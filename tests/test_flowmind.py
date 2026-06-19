@@ -225,6 +225,129 @@ def test_executor_uses_saved_gmail_integration(tmp_path, monkeypatch):
     assert "no action was taken" in run.summary.lower()
 
 
+def test_notion_page_receives_email_title_and_content(tmp_path, monkeypatch):
+    service, repository = build_service(tmp_path)
+    data_source_id = "bc1211ca-e3f1-4939-ae34-5260b16f627c"
+    repository.save_integration(
+        "notion",
+        {"api_token": "secret", "data_source_id": data_source_id},
+    )
+    analysis = service.analyze(
+        "Check email for newsletters and add its details to a page in my Notion."
+    )
+    workflow = service.build_analyzed_workflow(
+        analysis.proposed_workflow,
+        user_id="user_owner",
+        instruction=analysis.instruction,
+    )
+    captured = {}
+
+    def fake_post(_url, payload, headers=None):
+        captured["payload"] = payload
+        captured["headers"] = headers
+        return {"id": "page_123"}
+
+    monkeypatch.setattr(service.executor, "_post_json", fake_post)
+
+    run = service.run_workflow(
+        workflow,
+        input_payload={
+            "email": {
+                "from": "news@example.com",
+                "to": "owner@example.com",
+                "subject": "Weekly newsletter",
+                "date": "2026-06-19",
+                "body": "The complete newsletter content.",
+            }
+        },
+    )
+
+    assert run.status == "success"
+    assert run.steps[-1].output["created_page"]["title"] == "Email: Weekly newsletter"
+    assert captured["payload"]["parent"] == {
+        "type": "data_source_id",
+        "data_source_id": data_source_id,
+    }
+    assert captured["headers"]["Notion-Version"] == "2025-09-03"
+    children = captured["payload"]["children"]
+    copied_content = "\n".join(
+        block["paragraph"]["rich_text"][0]["text"]["content"]
+        for block in children
+    )
+    assert "news@example.com" in copied_content
+    assert "Weekly newsletter" in copied_content
+    assert "The complete newsletter content." in copied_content
+
+
+def test_legacy_notion_database_id_is_resolved_and_migrated(tmp_path, monkeypatch):
+    service, repository = build_service(tmp_path)
+    database_id = "6ee911d9-189c-4844-93e8-260c1438b6e4"
+    data_source_id = "bc1211ca-e3f1-4939-ae34-5260b16f627c"
+    repository.save_integration(
+        "notion",
+        {"api_token": "secret", "database_id": database_id},
+    )
+    analysis = service.analyze(
+        "When an email arrives, add its details to a page in my Notion."
+    )
+    workflow = service.build_analyzed_workflow(
+        analysis.proposed_workflow,
+        user_id="user_owner",
+        instruction=analysis.instruction,
+    )
+    captured = {}
+
+    def fake_get(url, headers=None):
+        captured["get_url"] = url
+        captured["get_headers"] = headers
+        return {"data_sources": [{"id": data_source_id, "name": "Newsletter archive"}]}
+
+    def fake_post(_url, payload, headers=None):
+        captured["payload"] = payload
+        return {"id": "page_123"}
+
+    monkeypatch.setattr(service.executor, "_get_json", fake_get)
+    monkeypatch.setattr(service.executor, "_post_json", fake_post)
+
+    run = service.run_workflow(
+        workflow,
+        input_payload={
+            "email": {
+                "from": "news@example.com",
+                "subject": "Newsletter",
+                "body": "Content",
+            }
+        },
+    )
+
+    assert run.status == "success"
+    assert captured["get_url"].endswith(f"/v1/databases/{database_id}")
+    assert captured["get_headers"]["Notion-Version"] == "2025-09-03"
+    assert captured["payload"]["parent"]["data_source_id"] == data_source_id
+    assert repository.get_integration("notion")["data_source_id"] == data_source_id
+
+
+def test_notion_integration_rejects_email_as_data_source_id(tmp_path, monkeypatch):
+    repository = WorkflowRepository(str(tmp_path / "notion-invalid.sqlite3"))
+    repository.save_member(TeamMember(id="admin_1", email="admin@example.com", role="admin"))
+    monkeypatch.setattr(api_main, "repository", repository)
+
+    response = TestClient(api_main.app).put(
+        "/integrations/notion",
+        json={
+            "config": {
+                "api_token": "secret",
+                "data_source_id": "rithvikkumar35@gmail.com",
+            }
+        },
+        headers={"X-User-Id": "admin_1"},
+    )
+
+    assert response.status_code == 422
+    assert "not an email address" in response.json()["detail"]
+    assert repository.get_integration("notion") == {}
+
+
 def test_gmail_integration_rejects_normal_account_password(tmp_path, monkeypatch):
     repository = WorkflowRepository(str(tmp_path / "gmail-password.sqlite3"))
     repository.save_member(TeamMember(id="admin_1", email="admin@example.com", role="admin"))
