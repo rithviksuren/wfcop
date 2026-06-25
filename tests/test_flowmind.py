@@ -4,12 +4,14 @@ from fastapi.testclient import TestClient
 
 from copilot_api import main as api_main
 from copilot_api.auth import GoogleOAuthConfig
+from copilot_api.executor import WorkflowExecutionError
 from copilot_api.llm import HeuristicProvider
 from copilot_api.models import (
     ShareWorkflowRequest,
     TeamMember,
     UpdateWorkflowRequest,
     WorkflowPermissionGrant,
+    WorkflowRun,
     WorkflowTask,
 )
 from copilot_api.repository import WorkflowRepository
@@ -247,6 +249,7 @@ def test_notion_page_receives_email_title_and_content(tmp_path, monkeypatch):
         captured["headers"] = headers
         return {"id": "page_123"}
 
+    monkeypatch.setattr(service.executor, "_get_json", lambda *_args, **_kwargs: {"id": data_source_id})
     monkeypatch.setattr(service.executor, "_post_json", fake_post)
 
     run = service.run_workflow(
@@ -325,6 +328,47 @@ def test_legacy_notion_database_id_is_resolved_and_migrated(tmp_path, monkeypatc
     assert captured["get_headers"]["Notion-Version"] == "2025-09-03"
     assert captured["payload"]["parent"]["data_source_id"] == data_source_id
     assert repository.get_integration("notion")["data_source_id"] == data_source_id
+
+
+def test_notion_inaccessible_data_source_has_actionable_error(tmp_path, monkeypatch):
+    service, repository = build_service(tmp_path)
+    data_source_id = "8dde6d9b-1519-4628-a273-4073a41995bb"
+    repository.save_integration(
+        "notion",
+        {"api_token": "secret", "data_source_id": data_source_id},
+    )
+    analysis = service.analyze(
+        "When an email arrives, add its details to a page in my Notion."
+    )
+    workflow = service.build_analyzed_workflow(
+        analysis.proposed_workflow,
+        user_id="user_owner",
+        instruction=analysis.instruction,
+    )
+
+    def inaccessible_data_source(*_args, **_kwargs):
+        raise WorkflowExecutionError(
+            'Integration request failed with HTTP 404: '
+            '{"object":"error","code":"object_not_found"}'
+        )
+
+    monkeypatch.setattr(service.executor, "_get_json", inaccessible_data_source)
+
+    run = service.run_workflow(
+        workflow,
+        input_payload={
+            "email": {
+                "from": "news@example.com",
+                "subject": "Newsletter",
+                "body": "Content",
+            }
+        },
+    )
+
+    assert run.status == "failed"
+    assert "Notion cannot access the selected data source" in run.steps[-1].error
+    assert "Connections" in run.steps[-1].error
+    assert "object_not_found" not in run.steps[-1].error
 
 
 def test_notion_integration_rejects_email_as_data_source_id(tmp_path, monkeypatch):
@@ -552,6 +596,7 @@ def test_tasks_endpoint_returns_visible_tasks_without_source_payload(tmp_path, m
         user_id="admin_1",
     ).workflow
     repository.save(workflow)
+    repository.save_run(WorkflowRun(id="run_1", workflow_id=workflow.id, trigger_type="manual"))
     repository.save_task(
         WorkflowTask(
             workflow_id=workflow.id,
@@ -580,6 +625,7 @@ def test_tasks_endpoint_decodes_existing_mime_encoded_titles(tmp_path, monkeypat
         user_id="admin_1",
     ).workflow
     repository.save(workflow)
+    repository.save_run(WorkflowRun(id="run_1", workflow_id=workflow.id, trigger_type="manual"))
     repository.save_task(
         WorkflowTask(
             workflow_id=workflow.id,

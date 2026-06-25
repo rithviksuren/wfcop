@@ -147,6 +147,45 @@ def test_mail_related_to_topic_becomes_gmail_search_filter_and_task(tmp_path):
     }
 
 
+def test_topic_related_mail_uses_the_topic_as_the_search_value(tmp_path):
+    engine, _ = build_engine(tmp_path)
+
+    analysis = engine.analyze(
+        "Check my inbox for job related mails and create a task"
+    )
+
+    assert analysis.intent.apps == ["Gmail"]
+    assert [node.type for node in analysis.proposed_workflow.nodes] == [
+        "gmail_trigger",
+        "filter_condition",
+        "task_create",
+    ]
+    assert analysis.proposed_workflow.nodes[0].config["search_text"] == "job"
+    assert analysis.proposed_workflow.nodes[1].config == {
+        "field": "email_text",
+        "operator": "contains",
+        "value": "job",
+    }
+    assert analysis.proposed_workflow.nodes[0].description == (
+        'Find unread emails containing "job"'
+    )
+
+
+def test_quoted_email_phrase_remains_an_exact_multiword_search(tmp_path):
+    engine, _ = build_engine(tmp_path)
+
+    analysis = engine.analyze(
+        'Check emails containing phrase "job related mails" and create a task'
+    )
+
+    assert analysis.proposed_workflow.nodes[0].config["search_text"] == (
+        "job related mails"
+    )
+    assert analysis.proposed_workflow.nodes[1].config["value"] == (
+        "job related mails"
+    )
+
+
 def test_legacy_mail_webhook_is_repaired(tmp_path):
     engine, _ = build_engine(tmp_path)
     workflow = engine.propose_workflow(

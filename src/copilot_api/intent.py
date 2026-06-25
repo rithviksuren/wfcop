@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
+from .email_language import extract_email_search_text, has_email_reference
 from .models import Workflow, WorkflowEdge, WorkflowNode
 
 
@@ -20,21 +20,12 @@ def extract_workflow_intent(instruction: str) -> WorkflowIntent:
     text = instruction.strip()
     lowered = text.lower()
     intent = WorkflowIntent(
-        email_requested=bool(re.search(r"\b(?:email|e-mail|gmail|inbox|mail|message)\b", lowered)),
+        email_requested=has_email_reference(lowered),
         task_requested="task" in lowered or "task list" in lowered,
     )
 
-    quoted = re.search(r"""(?:word|phrase|containing|contains|with)\s+["']([^"']+)["']""", text, re.I)
-    unquoted = re.search(
-        r"\b(?:with\s+(?:the\s+)?word|containing|contains)\s+([A-Za-z0-9_-]+)",
-        text,
-        re.I,
-    )
-    if quoted or unquoted:
-        intent.filter_field = "email_text"
-        intent.filter_operator = "contains"
-        intent.filter_value = (quoted or unquoted).group(1).strip()
-    elif intent.email_requested:
+    search_text = extract_email_search_text(text)
+    if intent.email_requested:
         if any(
             term in lowered
             for term in ("tagged urgent", "tag urgent", "urgent email", "emails tagged urgent")
@@ -42,23 +33,10 @@ def extract_workflow_intent(instruction: str) -> WorkflowIntent:
             intent.filter_field = "tag"
             intent.filter_operator = "equals"
             intent.filter_value = "urgent"
-        else:
-            related = re.search(
-                r"\b(?:related to|about|regarding)\s+(.+?)(?:,|\s+and\s+(?:create|send|make|add)\b|$)",
-                text,
-                re.I,
-            )
-            email_for = re.search(
-                r"\b(?:emails?|e-mails?|mail|gmail|inbox)\s+for\s+"
-                r"(?!emails?\b|e-mails?\b|mail\b)(.+?)"
-                r"(?:,|\s+and\s+(?:create|send|make|add|save|copy|store|post)\b|$)",
-                text,
-                re.I,
-            )
-            if related or email_for:
-                intent.filter_field = "email_text"
-                intent.filter_operator = "contains"
-                intent.filter_value = (related or email_for).group(1).strip(" .")
+        elif search_text:
+            intent.filter_field = "email_text"
+            intent.filter_operator = "contains"
+            intent.filter_value = search_text
     elif any(term in lowered for term in ("tagged urgent", "tag urgent", "urgent email", "emails tagged urgent")):
         intent.filter_field = "tag"
         intent.filter_operator = "equals"

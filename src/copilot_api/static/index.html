@@ -8,7 +8,7 @@
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
     <link rel="shortcut icon" href="/favicon.ico" />
     <link rel="manifest" href="/static/site.webmanifest" />
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260622-1" />
   </head>
   <body>
     <section class="login-screen" id="login-screen">
@@ -43,12 +43,12 @@
 
     <div class="app-shell hidden" id="app-shell">
       <aside class="sidebar">
-        <div class="brand">
+        <button class="brand" id="home-button" type="button" aria-label="Go to FlowMind home">
           <div class="brand-mark" aria-hidden="true">
             <svg viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 10-13h-7l1-7Z" /></svg>
           </div>
           <span>FlowMind</span>
-        </div>
+        </button>
 
         <nav class="nav-list" aria-label="Primary navigation">
           <button class="nav-item active" type="button" data-view="workflows">
@@ -198,6 +198,25 @@
                   </button>
                 </div>
               </div>
+              <form class="workflow-ai-editor" id="workflow-refine-form">
+                <div>
+                  <span class="workflow-ai-eyebrow">Refine with AI</span>
+                  <h2>Change this workflow using plain language</h2>
+                  <p>Describe what to add, remove, or change. FlowMind will update the workflow and preserve unrelated steps.</p>
+                </div>
+                <div class="workflow-ai-input-row">
+                  <textarea
+                    id="workflow-refine-prompt"
+                    rows="3"
+                    placeholder="For example: Also create a Notion page, then notify Slack."
+                    required
+                  ></textarea>
+                  <button class="primary-button" type="submit" id="workflow-refine-submit">
+                    <span>Apply AI change</span>
+                  </button>
+                </div>
+                <div class="workflow-ai-result hidden" id="workflow-refine-result"></div>
+              </form>
               <div id="canvas" class="canvas"></div>
             </div>
             <aside class="run-panel">
@@ -226,6 +245,16 @@
         <div id="workflow-input-panel">
           <textarea id="workflow-prompt" rows="6" required>Whenever a customer fills a form, create a Jira ticket, notify Slack, update CRM and send a follow-up email.</textarea>
         </div>
+        <div class="clarification-panel hidden" id="clarification-panel">
+          <div class="analysis-section-heading">
+            <span>?</span>
+            <div>
+              <h3>A few details before I build it</h3>
+              <p>Answer these so FlowMind does not guess important workflow behavior.</p>
+            </div>
+          </div>
+          <div class="clarification-list" id="clarification-list"></div>
+        </div>
         <div class="schedule-grid" id="workflow-options">
           <label>
             <span>Mode</span>
@@ -252,6 +281,20 @@
               <p>No workflow has been created yet. Review the plan before building.</p>
             </div>
           </div>
+
+          <section class="analysis-section analysis-request-editor">
+            <div class="analysis-section-heading">
+              <span>↻</span>
+              <div>
+                <h3>Revise your request</h3>
+                <p>Edit the wording at any time and generate a fresh suggestion.</p>
+              </div>
+            </div>
+            <textarea id="analysis-request-editor" rows="4"></textarea>
+            <button class="ghost-button" type="button" id="reanalyze-request">
+              <span>Re-analyze request</span>
+            </button>
+          </section>
 
           <section class="analysis-section">
             <div class="analysis-section-heading">
@@ -314,6 +357,6 @@
     </div>
 
     <div class="toast hidden" id="toast"></div>
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260622-1"></script>
   </body>
 </html>

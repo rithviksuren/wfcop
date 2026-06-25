@@ -1,25 +1,50 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from typing import Any
+from typing import Any, Callable
 
 from .catalog import NODE_CATALOG, catalog_for_prompt
 from .models import Workflow, WorkflowEdge, WorkflowNode
-from .validation import validate_workflow
+from .validation import repair_workflow, validate_workflow
+
+
+logger = logging.getLogger(__name__)
 
 
 class LLMError(RuntimeError):
     pass
 
 
+class LLMAuthenticationError(LLMError):
+    pass
+
+
+class LLMRateLimitError(LLMError):
+    pass
+
+
+class LLMTimeoutError(LLMError):
+    pass
+
+
+class LLMResponseError(LLMError):
+    pass
+
+
 class LLMProvider(ABC):
     name: str
+
+    def bind_repository(self, repository: Any) -> None:
+        """Optionally provide read-only application data to provider tools."""
+        return None
 
     @abstractmethod
     def generate(self, task: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -29,85 +54,610 @@ class LLMProvider(ABC):
 class OpenAIProvider(LLMProvider):
     name = "openai"
 
-    def __init__(self, api_key: str, model: str = "gpt-4.1-mini") -> None:
+    API_URL = "https://api.openai.com/v1/responses"
+    TRANSIENT_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gpt-5.5",
+        *,
+        timeout_seconds: float = 45,
+        max_retries: int = 2,
+        max_tool_rounds: int = 2,
+        reasoning_effort: str = "low",
+        transport: Callable[[dict[str, Any]], tuple[dict[str, Any], dict[str, str]]] | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        repository: Any | None = None,
+    ) -> None:
         self.api_key = api_key
         self.model = model
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
+        self.max_tool_rounds = max_tool_rounds
+        self.reasoning_effort = reasoning_effort
+        self.transport = transport
+        self.sleeper = sleeper
+        self.repository = repository
+        self.last_request_id: str | None = None
+        self.last_response_id: str | None = None
+        self.last_usage: dict[str, Any] = {}
+        self.last_tool_calls: list[str] = []
 
     def generate(self, task: str, payload: dict[str, Any]) -> dict[str, Any]:
-        request_payload = {
+        prompt_payload = deepcopy(payload)
+        tool_context = prompt_payload.pop("_tool_context", {})
+        request_payload = self._base_request(task, prompt_payload)
+        response = self._request_with_retries(request_payload)
+        tool_rounds = 0
+
+        while True:
+            self._record_response(response)
+            tool_calls = [
+                item
+                for item in response.get("output", [])
+                if item.get("type") == "function_call"
+            ]
+            if not tool_calls:
+                return self._parse_structured_response(response)
+            if tool_rounds >= self.max_tool_rounds:
+                raise LLMResponseError(
+                    "OpenAI exceeded the allowed workflow-planning tool rounds."
+                )
+
+            outputs = []
+            for call in tool_calls:
+                name = str(call.get("name", ""))
+                self.last_tool_calls.append(name)
+                try:
+                    arguments = json.loads(call.get("arguments") or "{}")
+                except json.JSONDecodeError as exc:
+                    raise LLMResponseError(
+                        f"OpenAI returned invalid arguments for tool {name}."
+                    ) from exc
+                result = self._execute_tool(
+                    name,
+                    arguments,
+                    tool_context=tool_context,
+                )
+                outputs.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call.get("call_id"),
+                        "output": json.dumps(result, default=str),
+                    }
+                )
+
+            request_payload = {
+                **self._base_request(task, prompt_payload),
+                "previous_response_id": response.get("id"),
+                "input": outputs,
+            }
+            response = self._request_with_retries(request_payload)
+            tool_rounds += 1
+
+    def bind_repository(self, repository: Any) -> None:
+        self.repository = repository
+
+    def _base_request(
+        self,
+        task: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
             "model": self.model,
-            "response_format": {"type": "json_object"},
-            "messages": [
+            "instructions": self._instructions(task),
+            "input": json.dumps(
                 {
-                    "role": "system",
-                    "content": (
-                        "You are an AI workflow copilot. Return only valid JSON. "
-                        "Use the provided node catalog and preserve every explicit requirement in the instruction. "
-                        "A phrase such as 'emails with word X', 'containing X', or 'contains X' requires a "
-                        "filter_condition with field=email_text, operator=contains, and value=X; never omit it. "
-                        "For email text filters, also set gmail_trigger.search_text to X. "
-                        "Time phrases must configure workflow mode and trigger_schedule: every morning means "
-                        "mode=scheduled and trigger_schedule='daily at 09:00'. "
-                        "Task titles should use relevant event data, such as 'Email follow-up: {{subject}}', "
-                        "instead of unrelated generic text. Produce a clear, specific workflow name and labels. "
-                        "The response shape must be {\"workflow\": {...}, \"explanation\": string}."
-                    ),
+                    "task": task,
+                    "request": payload,
                 },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "task": task,
-                            "node_catalog": catalog_for_prompt(),
-                            "payload": payload,
-                            "workflow_schema": {
-                                "id": "string",
-                                "name": "string",
-                                "status": "draft|active|paused",
-                                "mode": "manual|scheduled",
-                                "trigger_schedule": "string|null",
-                                "nodes": [
-                                    {
-                                        "id": "string",
-                                        "type": "string",
-                                        "label": "specific human-readable label",
-                                        "description": "specific human-readable description",
-                                        "config": {},
-                                    }
-                                ],
-                                "edges": [{"from": "string", "to": "string"}],
-                            },
-                        },
-                        default=str,
-                    ),
+                default=str,
+            ),
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "workflow_copilot_result",
+                    "strict": True,
+                    "schema": self._result_schema(),
                 },
-            ],
+                "verbosity": "low",
+            },
+            "reasoning": {"effort": self.reasoning_effort},
+            "tools": self._tools(),
+            "tool_choice": "auto",
+            "max_output_tokens": 5000,
+            "store": False,
         }
+
+    def _instructions(self, task: str) -> str:
+        return (
+            "You are FlowMind's workflow planning engine. "
+            f"Complete the {task} operation and return the exact structured result. "
+            "Success means every explicit user requirement is represented, unrelated "
+            "steps are preserved for modify/fix operations, node configuration is "
+            "specific, and the graph is executable. Never invent extra actions. "
+            "Use search_nodes when node capabilities or defaults are uncertain. "
+            "Use get_workflow when a persisted workflow is referenced by id or prior "
+            "state is needed. "
+            "Use validate_workflow before finalizing when the candidate graph may be "
+            "invalid. Email text requirements need both Gmail search_text and a matching "
+            "filter_condition. Interpret category wording such as 'job-related emails' "
+            "as email text containing 'job'; do not use the whole category phrase as the "
+            "literal search value. Preserve a multiword literal only when the user quotes "
+            "it or explicitly calls it a phrase. Scheduled language must set mode, trigger_schedule, and "
+            "active status. Prefer event fields such as {{subject}}, {{from}}, and "
+            "{{body}} in action templates. Do not include secrets or credentials. "
+            "If validation feedback is supplied, repair every listed error."
+        )
+
+    def _request_with_retries(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        for attempt in range(self.max_retries + 1):
+            try:
+                body, headers = (
+                    self.transport(payload)
+                    if self.transport
+                    else self._http_post(payload)
+                )
+                self.last_request_id = (
+                    headers.get("x-request-id")
+                    or headers.get("X-Request-Id")
+                    or self.last_request_id
+                )
+                return body
+            except urllib.error.HTTPError as exc:
+                if exc.code == 401:
+                    logger.warning("OpenAI authentication failed.")
+                    raise LLMAuthenticationError(
+                        "OpenAI authentication failed. Check OPENAI_API_KEY."
+                    ) from exc
+                if exc.code in self.TRANSIENT_STATUS_CODES and attempt < self.max_retries:
+                    logger.warning(
+                        "Retrying transient OpenAI HTTP %s (attempt %s).",
+                        exc.code,
+                        attempt + 1,
+                    )
+                    self.sleeper(self._retry_delay(attempt, exc.headers))
+                    continue
+                if exc.code == 429:
+                    raise LLMRateLimitError(
+                        "OpenAI is rate limited or out of quota."
+                    ) from exc
+                raise LLMError(
+                    f"OpenAI request failed with HTTP {exc.code}."
+                ) from exc
+            except (urllib.error.URLError, TimeoutError) as exc:
+                if attempt < self.max_retries:
+                    logger.warning(
+                        "Retrying OpenAI transport failure (attempt %s).",
+                        attempt + 1,
+                    )
+                    self.sleeper(self._retry_delay(attempt))
+                    continue
+                raise LLMTimeoutError(
+                    "OpenAI could not be reached before the retry limit."
+                ) from exc
+            except json.JSONDecodeError as exc:
+                raise LLMResponseError(
+                    "OpenAI returned a response that was not valid JSON."
+                ) from exc
+        raise LLMError("OpenAI request failed.")
+
+    def _http_post(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, str]]:
         request = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
-            data=json.dumps(request_payload).encode("utf-8"),
+            self.API_URL,
+            data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            if exc.code == 429:
-                raise LLMError("OpenAI is rate limited or out of quota.") from exc
-            raise LLMError(f"OpenAI request failed with HTTP {exc.code}.") from exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise LLMError(f"OpenAI request failed: {exc}") from exc
+        with urllib.request.urlopen(
+            request,
+            timeout=self.timeout_seconds,
+        ) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            return body, dict(response.headers.items())
 
+    def _parse_structured_response(
+        self,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        if body.get("error"):
+            error = body["error"]
+            raise LLMResponseError(
+                f"OpenAI response failed: {error.get('message', 'unknown error')}"
+            )
+        if body.get("status") == "incomplete":
+            reason = (body.get("incomplete_details") or {}).get("reason", "unknown")
+            raise LLMResponseError(f"OpenAI response was incomplete: {reason}.")
+
+        output_text: str | None = body.get("output_text")
+        refusal: str | None = None
+        for item in body.get("output", []):
+            if item.get("type") != "message":
+                continue
+            for content in item.get("content", []):
+                if content.get("type") == "output_text":
+                    output_text = content.get("text")
+                elif content.get("type") == "refusal":
+                    refusal = content.get("refusal")
+        if refusal:
+            raise LLMResponseError(f"OpenAI refused the workflow request: {refusal}")
+        if not output_text:
+            raise LLMResponseError(
+                "OpenAI returned no structured workflow output."
+            )
         try:
-            content = body["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-        except (KeyError, IndexError, json.JSONDecodeError) as exc:
-            raise LLMError("OpenAI returned an unexpected response shape.") from exc
+            parsed = json.loads(output_text)
+            parsed["workflow"] = self._normalize_workflow(
+                parsed["workflow"]
+            )
+            Workflow.model_validate(parsed["workflow"])
+        except (KeyError, json.JSONDecodeError, ValueError) as exc:
+            raise LLMResponseError(
+                "OpenAI returned structured output that did not match the workflow contract."
+            ) from exc
+        parsed["provider"] = self.name
         return parsed
+
+    def _execute_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        tool_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if name == "search_nodes":
+            return self._search_nodes(
+                str(arguments.get("query", "")),
+                arguments.get("roles") or [],
+                int(arguments.get("limit", 5)),
+            )
+        if name == "validate_workflow":
+            try:
+                workflow = Workflow.model_validate(
+                    self._normalize_workflow(arguments["workflow"])
+                )
+            except (KeyError, ValueError) as exc:
+                return {
+                    "valid": False,
+                    "errors": [
+                        {
+                            "code": "schema_error",
+                            "message": str(exc),
+                        }
+                    ],
+                }
+            return validate_workflow(workflow).model_dump()
+        if name == "get_workflow":
+            return self._get_workflow(
+                str(arguments.get("workflow_id", "")),
+                tool_context or {},
+            )
+        raise LLMResponseError(f"OpenAI requested unsupported tool {name}.")
+
+    def _tools(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "name": "search_nodes",
+                "description": (
+                    "Search supported workflow nodes by capability, app, action, or "
+                    "trigger. Returns required configuration, role, and safe defaults."
+                ),
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "Capability query such as 'email trigger', "
+                                "'send Teams notification', or 'create task'."
+                            ),
+                        },
+                        "roles": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["trigger", "condition", "action"],
+                            },
+                            "description": "Optional roles to include.",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 20,
+                        },
+                    },
+                    "required": ["query", "roles", "limit"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "validate_workflow",
+                "description": (
+                    "Validate a candidate workflow for required configuration and graph "
+                    "integrity before returning the final result."
+                ),
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "workflow": self._workflow_schema(),
+                    },
+                    "required": ["workflow"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "get_workflow",
+                "description": (
+                    "Retrieve a persisted workflow by id when the current user is "
+                    "allowed to access it. Returns the graph without credentials."
+                ),
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "workflow_id": {
+                            "type": "string",
+                            "description": "Persisted workflow id.",
+                        }
+                    },
+                    "required": ["workflow_id"],
+                },
+            },
+        ]
+
+    def _search_nodes(
+        self,
+        query: str,
+        roles: list[str],
+        limit: int,
+    ) -> dict[str, Any]:
+        query_tokens = set(re.findall(r"[a-z0-9]+", query.lower()))
+        requested_roles = set(roles)
+        ranked = []
+        for item in catalog_for_prompt():
+            if requested_roles and item["role"] not in requested_roles:
+                continue
+            text = " ".join(
+                [
+                    item["type"].replace("_", " "),
+                    item["description"],
+                    item["role"],
+                    *item["required_config"],
+                    *item["defaults"].keys(),
+                ]
+            ).lower()
+            tokens = set(re.findall(r"[a-z0-9]+", text))
+            overlap = len(query_tokens & tokens)
+            phrase_bonus = 2 if query.lower() in text and query else 0
+            ranked.append((overlap + phrase_bonus, item["type"], item))
+        ranked.sort(key=lambda entry: (-entry[0], entry[1]))
+        matched = [
+            item
+            for score, _, item in ranked
+            if score > 0 or not query_tokens
+        ][: max(1, min(limit, 20))]
+        return {"query": query, "nodes": matched}
+
+    def _get_workflow(
+        self,
+        workflow_id: str,
+        tool_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self.repository is None:
+            return {
+                "found": False,
+                "error": "Workflow repository is unavailable.",
+            }
+        user_id = tool_context.get("user_id")
+        if not user_id:
+            return {
+                "found": False,
+                "error": "Authenticated workflow context is required.",
+            }
+        workflow = self.repository.get(workflow_id)
+        if workflow is None:
+            return {"found": False}
+        member = self.repository.get_member(user_id)
+        permission = self.repository.permission_for_user(
+            workflow,
+            user_id,
+            member.role if member else None,
+        )
+        if permission is None:
+            return {"found": False}
+        payload = workflow.model_dump(mode="json", by_alias=True)
+        for node in payload["nodes"]:
+            node["config"] = self._sanitize_tool_config(node["config"])
+        return {
+            "found": True,
+            "permission": permission,
+            "workflow": payload,
+        }
+
+    def _sanitize_tool_config(
+        self,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        sensitive_fragments = (
+            "token",
+            "secret",
+            "password",
+            "webhook_url",
+            "service_account",
+            "api_key",
+            "access_key",
+        )
+        return {
+            key: value
+            for key, value in config.items()
+            if not any(fragment in key.lower() for fragment in sensitive_fragments)
+        }
+
+    def _result_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "workflow": self._workflow_schema(),
+                "explanation": {"type": "string"},
+            },
+            "required": ["workflow", "explanation"],
+        }
+
+    def _workflow_schema(self) -> dict[str, Any]:
+        config_keys = sorted(
+            {
+                key
+                for definition in NODE_CATALOG.values()
+                for key in (
+                    *definition.required_config,
+                    *definition.defaults.keys(),
+                )
+            }
+        )
+        config_properties = {
+            key: {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "integer"},
+                    {"type": "number"},
+                    {"type": "boolean"},
+                    {"type": "null"},
+                ]
+            }
+            for key in config_keys
+        }
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "name": {"type": "string"},
+                "status": {
+                    "type": "string",
+                    "enum": ["draft", "active", "paused"],
+                },
+                "visibility": {
+                    "type": "string",
+                    "enum": ["private", "team", "restricted"],
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["manual", "scheduled"],
+                },
+                "trigger_schedule": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}]
+                },
+                "nodes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "id": {"type": "string"},
+                            "type": {
+                                "type": "string",
+                                "enum": sorted(NODE_CATALOG),
+                            },
+                            "role": {
+                                "type": "string",
+                                "enum": ["trigger", "condition", "action"],
+                            },
+                            "label": {"type": "string"},
+                            "description": {"type": "string"},
+                            "config": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": config_properties,
+                                "required": config_keys,
+                            },
+                        },
+                        "required": [
+                            "id",
+                            "type",
+                            "role",
+                            "label",
+                            "description",
+                            "config",
+                        ],
+                    },
+                },
+                "edges": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "from": {"type": "string"},
+                            "to": {"type": "string"},
+                        },
+                        "required": ["from", "to"],
+                    },
+                },
+            },
+            "required": [
+                "name",
+                "status",
+                "visibility",
+                "mode",
+                "trigger_schedule",
+                "nodes",
+                "edges",
+            ],
+        }
+
+    def _normalize_workflow(
+        self,
+        workflow: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized = deepcopy(workflow)
+        for node in normalized.get("nodes", []):
+            config = node.get("config") or {}
+            node["config"] = {
+                key: value
+                for key, value in config.items()
+                if value is not None
+            }
+        return normalized
+
+    def _record_response(self, response: dict[str, Any]) -> None:
+        self.last_response_id = response.get("id")
+        self.last_usage = response.get("usage") or {}
+        logger.info(
+            "OpenAI response completed response_id=%s request_id=%s total_tokens=%s",
+            self.last_response_id,
+            self.last_request_id,
+            self.last_usage.get("total_tokens"),
+        )
+
+    def _retry_delay(
+        self,
+        attempt: int,
+        headers: Any | None = None,
+    ) -> float:
+        if headers:
+            retry_after = headers.get("retry-after")
+            if retry_after:
+                try:
+                    return min(float(retry_after), 10.0)
+                except ValueError:
+                    pass
+        return min(0.5 * (2**attempt), 4.0)
 
 
 class FallbackProvider(LLMProvider):
@@ -116,6 +666,10 @@ class FallbackProvider(LLMProvider):
         self.fallback = fallback
         self.name = f"{primary.name}-with-{fallback.name}"
         self.last_error: str | None = None
+
+    def bind_repository(self, repository: Any) -> None:
+        self.primary.bind_repository(repository)
+        self.fallback.bind_repository(repository)
 
     def generate(self, task: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -179,8 +733,12 @@ class HeuristicProvider(LLMProvider):
 
         for error in errors:
             node_id = error.get("node_id")
+            node_type = error.get("node_type")
             field = error.get("field")
-            node = node_map.get(node_id or "")
+            node = node_map.get(node_id or "") or next(
+                (item for item in fixed.nodes if item.type == node_type),
+                None,
+            )
             if node and field:
                 definition = NODE_CATALOG.get(node.type)
                 if definition and field in definition.defaults:
@@ -192,7 +750,7 @@ class HeuristicProvider(LLMProvider):
             root = fixed.nodes[0]
             fixed.edges = [WorkflowEdge(from_=root.id, to=node.id) for node in fixed.nodes[1:]]
         fixed.name = self._name_for_workflow(fixed)
-        return fixed
+        return repair_workflow(fixed)
 
     def _nodes_for_instruction(self, instruction: str) -> list[WorkflowNode]:
         text = instruction.lower()
@@ -222,6 +780,19 @@ class HeuristicProvider(LLMProvider):
                     {"channel_id": channel, "message_template": "New matching email received."},
                 )
             )
+        elif "notification" in text and any(
+            term in text for term in ("email", "gmail", "inbox")
+        ):
+            nodes.append(
+                self._node(
+                    "slack_message",
+                    f"node_{len(nodes) + 1}",
+                    {
+                        "channel_id": "general",
+                        "message_template": "New email from {{from}}: {{subject}}",
+                    },
+                )
+            )
         if "notion" in text or "page" in text:
             nodes.append(self._node("notion_create_page", f"node_{len(nodes) + 1}"))
         if "teams" in text:
@@ -233,7 +804,12 @@ class HeuristicProvider(LLMProvider):
         merged = dict(definition.defaults)
         if config:
             merged.update(config)
-        return WorkflowNode(id=node_id, type=node_type, config=merged)
+        return WorkflowNode(
+            id=node_id,
+            type=node_type,
+            role=definition.role,
+            config=merged,
+        )
 
     def _linear_workflow(self, name: str, nodes: list[WorkflowNode]) -> Workflow:
         edges = [WorkflowEdge(from_=nodes[index].id, to=nodes[index + 1].id) for index in range(len(nodes) - 1)]
@@ -272,7 +848,21 @@ def build_provider() -> LLMProvider:
     api_key = os.getenv("OPENAI_API_KEY")
     if api_key:
         return FallbackProvider(
-            primary=OpenAIProvider(api_key=api_key, model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini")),
+            primary=OpenAIProvider(
+                api_key=api_key,
+                model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
+                timeout_seconds=float(
+                    os.getenv("OPENAI_TIMEOUT_SECONDS", "45")
+                ),
+                max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "2")),
+                max_tool_rounds=int(
+                    os.getenv("OPENAI_MAX_TOOL_ROUNDS", "2")
+                ),
+                reasoning_effort=os.getenv(
+                    "OPENAI_REASONING_EFFORT",
+                    "low",
+                ),
+            ),
             fallback=HeuristicProvider(),
         )
     return HeuristicProvider()

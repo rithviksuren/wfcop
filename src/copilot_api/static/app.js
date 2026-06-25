@@ -11,6 +11,7 @@ const state = {
   selectedFilter: "all",
   search: "",
   pendingAnalysis: null,
+  pendingPlanSession: null,
   selectedRecommendationId: null,
 };
 
@@ -30,6 +31,13 @@ const els = {
   createModal: document.querySelector("#create-modal"),
   createForm: document.querySelector("#create-form"),
   analysisReview: document.querySelector("#analysis-review"),
+  clarificationPanel: document.querySelector("#clarification-panel"),
+  clarificationList: document.querySelector("#clarification-list"),
+  analysisRequestEditor: document.querySelector("#analysis-request-editor"),
+  workflowRefineForm: document.querySelector("#workflow-refine-form"),
+  workflowRefinePrompt: document.querySelector("#workflow-refine-prompt"),
+  workflowRefineSubmit: document.querySelector("#workflow-refine-submit"),
+  workflowRefineResult: document.querySelector("#workflow-refine-result"),
   toast: document.querySelector("#toast"),
   loginScreen: document.querySelector("#login-screen"),
   appShell: document.querySelector("#app-shell"),
@@ -662,6 +670,24 @@ function renderDetail() {
   `;
 }
 
+function operationSummary(operation) {
+  const labels = {
+    add_node: "Added",
+    update_node: "Updated",
+    remove_node: "Removed",
+    connect_nodes: "Connected",
+    disconnect_nodes: "Disconnected",
+    update_workflow: "Updated workflow",
+  };
+  const subject =
+    operation.node?.label ||
+    operation.node?.type?.replaceAll("_", " ") ||
+    operation.node_id ||
+    operation.reason ||
+    "workflow";
+  return `${labels[operation.op] || "Changed"} ${subject}`;
+}
+
 function renderNode(node, index) {
   return `
     <article class="node-card" data-node-id="${node.id}">
@@ -710,7 +736,7 @@ function describeRunOutcome(run) {
     return {
       label: "Needs attention",
       className: "failed",
-      message: run.summary || "The workflow could not finish.",
+      message: friendlyError(run.summary || "The workflow could not finish."),
     };
   }
   if (run.steps.some((step) => step.output?.condition?.matched === false)) {
@@ -785,8 +811,8 @@ function describeRunStep(step) {
           : "The workflow stopped here, so no action was taken.",
         details: compactDetails([
           ["Checked", humanizeField(condition.field)],
-          ["Email value", readableValue(condition.actual)],
-          ["Required value", readableValue(condition.expected)],
+          ["Email value", readableValue(condition.actual, 90)],
+          ["Required value", readableValue(condition.expected, 60)],
         ]),
       };
     }
@@ -926,10 +952,14 @@ function readableSender(value) {
   return String(value).replace(/^"+|"+$/g, "").replace(/\s*<([^>]+)>/, " ($1)");
 }
 
-function readableValue(value) {
+function readableValue(value, limit = 100) {
   if (value === undefined || value === null || value === "") return "Not provided";
-  if (Array.isArray(value)) return value.length ? value.join(", ") : "None";
-  return String(value);
+  const text = Array.isArray(value) ? (value.length ? value.join(", ") : "None") : String(value);
+  const clean = text
+    .replace(/https?:\/\/\S+/gi, "[link]")
+    .replace(/\s+/g, " ")
+    .trim();
+  return clean.length > limit ? `${clean.slice(0, limit).trim()}…` : clean;
 }
 
 function humanizeField(value) {
@@ -953,6 +983,12 @@ function friendlyError(error) {
   const message = String(error);
   if (/application-specific password|required.*app password|invalid credentials/i.test(message)) {
     return "Google rejected the Gmail login. Open Integrations and reconnect Gmail with a Google app password.";
+  }
+  if (/(?:http 404|object_not_found|could not find data_source)[\s\S]*(?:data_source|notion)|notion[\s\S]*(?:http 404|object_not_found|could not find data_source)/i.test(message)) {
+    return "Notion cannot access the selected data source. Open the database in Notion, choose ••• → Connections, and add the same Notion integration whose token is saved in FlowMind. If the database is in another workspace, use an integration token from that workspace. Then verify the Data source ID under Integrations → Notion and run the workflow again.";
+  }
+  if (/notion[\s\S]*(?:http 401|unauthorized)/i.test(message)) {
+    return "The saved Notion integration token is invalid or expired. Save the correct internal integration secret under Integrations → Notion and retry.";
   }
   return message
     .replace(/^Workflow failed at step \d+:\s*/i, "")
@@ -984,6 +1020,10 @@ async function deleteWorkflow(id) {
 
 async function createWorkflow(event) {
   event.preventDefault();
+  await advanceWorkflowPlan();
+}
+
+async function advanceWorkflowPlan() {
   const submit = document.querySelector("#create-submit");
   const prompt = document.querySelector("#workflow-prompt").value.trim();
   const mode = document.querySelector("#workflow-mode").value;
@@ -991,13 +1031,37 @@ async function createWorkflow(event) {
   if (!prompt) return;
 
   submit.disabled = true;
-  submit.querySelector("span").textContent = state.pendingAnalysis ? "Building..." : "Analyzing...";
+  submit.querySelector("span").textContent = state.pendingAnalysis
+    ? "Building..."
+    : state.pendingPlanSession
+    ? "Continuing..."
+    : "Planning...";
   try {
     if (!state.pendingAnalysis) {
-      state.pendingAnalysis = await api("/copilot/analyze", {
-        method: "POST",
-        body: JSON.stringify({ instruction: prompt, context: {} }),
-      });
+      let result;
+      if (state.pendingPlanSession) {
+        const answers = Object.fromEntries(
+          [...els.clarificationList.querySelectorAll("[data-question-id]")].map((input) => [
+            input.dataset.questionId,
+            input.value.trim(),
+          ])
+        );
+        result = await api(`/copilot/plans/${state.pendingPlanSession.id}/answers`, {
+          method: "POST",
+          body: JSON.stringify({ answers }),
+        });
+      } else {
+        result = await api("/copilot/plans", {
+          method: "POST",
+          body: JSON.stringify({ instruction: prompt, context: {} }),
+        });
+      }
+      state.pendingPlanSession = result.session;
+      if (!result.analysis) {
+        renderClarifyingQuestions(result.session);
+        return;
+      }
+      state.pendingAnalysis = result.analysis;
       state.selectedRecommendationId = state.pendingAnalysis.recommendations[0]?.id || null;
       renderWorkflowAnalysis(state.pendingAnalysis);
       submit.querySelector("span").textContent = "Build Workflow";
@@ -1027,14 +1091,50 @@ async function createWorkflow(event) {
     showToast(error.message);
   } finally {
     submit.disabled = Boolean(state.pendingAnalysis?.unsupported_tasks?.length);
-    submit.querySelector("span").textContent = state.pendingAnalysis ? "Build Workflow" : "Analyze Request";
+    submit.querySelector("span").textContent = state.pendingAnalysis
+      ? "Build Workflow"
+      : state.pendingPlanSession?.status === "awaiting_clarification"
+      ? "Continue planning"
+      : "Plan workflow";
   }
+}
+
+function renderClarifyingQuestions(session) {
+  document.querySelector("#workflow-input-panel").classList.add("hidden");
+  document.querySelector("#workflow-options").classList.add("hidden");
+  els.analysisReview.classList.add("hidden");
+  els.clarificationPanel.classList.remove("hidden");
+  document.querySelector("#edit-analysis").classList.remove("hidden");
+  els.clarificationList.innerHTML = session.questions
+    .map((question) => {
+      const choices = question.choices || [];
+      const input = choices.length
+        ? `<select data-question-id="${escapeHtml(question.id)}" required>
+            <option value="">Choose an answer</option>
+            ${choices
+              .map((choice) => `<option value="${escapeHtml(choice)}">${escapeHtml(choice)}</option>`)
+              .join("")}
+          </select>`
+        : `<input data-question-id="${escapeHtml(question.id)}" type="text" required />`;
+      return `
+        <label class="clarification-question">
+          <strong>${escapeHtml(question.question)}</strong>
+          <small>${escapeHtml(question.reason)}</small>
+          ${input}
+        </label>
+      `;
+    })
+    .join("");
+  document.querySelector("#create-submit span").textContent = "Continue planning";
 }
 
 function renderWorkflowAnalysis(analysis) {
   document.querySelector("#workflow-input-panel").classList.add("hidden");
+  document.querySelector("#workflow-options").classList.remove("hidden");
+  els.clarificationPanel.classList.add("hidden");
   els.analysisReview.classList.remove("hidden");
   document.querySelector("#edit-analysis").classList.remove("hidden");
+  els.analysisRequestEditor.value = analysis.instruction;
   document.querySelector("#analysis-trigger").textContent = analysis.extracted.trigger;
   document.querySelector("#analysis-goal").textContent = analysis.extracted.goal;
   document.querySelector("#analysis-tasks").innerHTML = analysis.extracted.tasks
@@ -1067,6 +1167,13 @@ function renderWorkflowAnalysis(analysis) {
             </div>
             <p>${escapeHtml(recommendation.description)}</p>
             <small>${escapeHtml(recommendation.reason)}</small>
+            ${
+              recommendation.steps?.length
+                ? `<ol>${recommendation.steps
+                    .map((step) => `<li>${escapeHtml(step)}</li>`)
+                    .join("")}</ol>`
+                : ""
+            }
           </div>
         </div>
       `
@@ -1119,12 +1226,69 @@ function renderWorkflowAnalysis(analysis) {
 
 function resetWorkflowAnalysis() {
   state.pendingAnalysis = null;
+  state.pendingPlanSession = null;
   state.selectedRecommendationId = null;
   document.querySelector("#workflow-input-panel").classList.remove("hidden");
+  document.querySelector("#workflow-options").classList.remove("hidden");
+  els.clarificationPanel.classList.add("hidden");
   els.analysisReview.classList.add("hidden");
   document.querySelector("#edit-analysis").classList.add("hidden");
   document.querySelector("#create-submit").disabled = false;
   document.querySelector("#create-submit span").textContent = "Analyze Request";
+}
+
+async function reanalyzeRequest() {
+  const revised = els.analysisRequestEditor.value.trim();
+  if (!revised) return;
+  document.querySelector("#workflow-prompt").value = revised;
+  resetWorkflowAnalysis();
+  await advanceWorkflowPlan();
+}
+
+async function refineSelectedWorkflow(event) {
+  event.preventDefault();
+  if (!state.selectedWorkflow) return;
+  const instruction = els.workflowRefinePrompt.value.trim();
+  if (!instruction) return;
+
+  els.workflowRefineSubmit.disabled = true;
+  els.workflowRefineSubmit.querySelector("span").textContent = "Applying...";
+  els.workflowRefineResult.classList.add("hidden");
+  try {
+    const result = await api("/copilot/modify", {
+      method: "POST",
+      body: JSON.stringify({
+        workflow: state.selectedWorkflow,
+        instruction,
+        context: {},
+      }),
+    });
+    state.selectedWorkflow = result.workflow;
+    state.workflows = await api("/workflows");
+    els.workflowRefinePrompt.value = "";
+    els.workflowRefineResult.innerHTML = `
+      <strong>Workflow updated</strong>
+      <p>${escapeHtml(result.explanation || "Your requested change was applied and validated.")}</p>
+      ${
+        result.operations?.length
+          ? `<ul>${result.operations
+              .map((operation) => `<li>${escapeHtml(operationSummary(operation))}</li>`)
+              .join("")}</ul>`
+          : ""
+      }
+    `;
+    els.workflowRefineResult.classList.remove("hidden");
+    render();
+    showToast("AI changes applied");
+  } catch (error) {
+    els.workflowRefineResult.innerHTML = `<strong>Could not apply that change</strong><p>${escapeHtml(
+      error.message
+    )}</p>`;
+    els.workflowRefineResult.classList.remove("hidden");
+  } finally {
+    els.workflowRefineSubmit.disabled = false;
+    els.workflowRefineSubmit.querySelector("span").textContent = "Apply AI change";
+  }
 }
 
 async function saveWorkflowEdits() {
@@ -1254,6 +1418,8 @@ document.querySelectorAll(".nav-item").forEach((item) => {
   item.addEventListener("click", () => setView(item.dataset.view));
 });
 
+document.querySelector("#home-button").addEventListener("click", () => setView("workflows"));
+
 document.querySelector("#new-workflow-button").addEventListener("click", () => {
   els.createModal.classList.remove("hidden");
   document.querySelector("#workflow-prompt").focus();
@@ -1303,7 +1469,9 @@ document.querySelector("#cancel-create").addEventListener("click", () => {
   resetWorkflowAnalysis();
 });
 document.querySelector("#edit-analysis").addEventListener("click", resetWorkflowAnalysis);
+document.querySelector("#reanalyze-request").addEventListener("click", reanalyzeRequest);
 document.querySelector("#create-form").addEventListener("submit", createWorkflow);
+els.workflowRefineForm.addEventListener("submit", refineSelectedWorkflow);
 document.querySelector("#invite-form").addEventListener("submit", inviteMember);
 document.querySelector("#back-button").addEventListener("click", () => setView("workflows"));
 document.querySelector("#save-workflow-button").addEventListener("click", saveWorkflowEdits);

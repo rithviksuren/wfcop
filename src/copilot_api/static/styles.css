@@ -241,14 +241,28 @@ svg {
 }
 
 .brand {
+  width: 100%;
   height: 74px;
   display: flex;
   align-items: center;
   gap: 14px;
+  border: 0;
   padding: 0 18px;
   border-bottom: 1px solid var(--line-soft);
+  background: transparent;
+  color: white;
   font-size: 18px;
   font-weight: 800;
+  text-align: left;
+}
+
+.brand:hover {
+  background: #0d131c;
+}
+
+.brand:focus-visible {
+  outline: 2px solid var(--purple-2);
+  outline-offset: -3px;
 }
 
 .brand-mark {
@@ -1082,6 +1096,68 @@ textarea:focus {
   overflow: auto;
 }
 
+.workflow-ai-editor {
+  display: grid;
+  gap: 14px;
+  margin: 24px 31px 0;
+  border: 1px solid rgba(139, 63, 244, 0.3);
+  border-radius: 15px;
+  padding: 18px;
+  background:
+    linear-gradient(135deg, rgba(139, 63, 244, 0.09), rgba(67, 140, 255, 0.04)),
+    #111821;
+}
+
+.workflow-ai-editor h2 {
+  margin-top: 4px;
+  font-size: 17px;
+}
+
+.workflow-ai-editor p {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.workflow-ai-eyebrow {
+  color: var(--purple-2);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.workflow-ai-input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+}
+
+.workflow-ai-input-row textarea {
+  min-height: 78px;
+  resize: vertical;
+}
+
+.workflow-ai-result {
+  border: 1px solid rgba(67, 211, 139, 0.24);
+  border-radius: 11px;
+  padding: 12px 14px;
+  background: rgba(67, 211, 139, 0.07);
+}
+
+.workflow-ai-result p,
+.workflow-ai-result ul {
+  margin-top: 6px;
+}
+
+.workflow-ai-result ul {
+  padding-left: 18px;
+  color: #b8c7d8;
+  font-size: 12px;
+}
+
 .node-card {
   width: min(580px, 100%);
   position: relative;
@@ -1262,6 +1338,10 @@ textarea:focus {
   font-size: 12px;
   line-height: 1.4;
   overflow-wrap: anywhere;
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .run-list {
@@ -1374,6 +1454,44 @@ textarea:focus {
 .analysis-review {
   display: grid;
   gap: 16px;
+}
+
+.analysis-request-editor textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.analysis-request-editor .ghost-button {
+  justify-self: start;
+}
+
+.clarification-panel {
+  display: grid;
+  gap: 16px;
+  border: 1px solid rgba(255, 200, 61, 0.26);
+  border-radius: 14px;
+  padding: 17px;
+  background: rgba(255, 200, 61, 0.05);
+}
+
+.clarification-list {
+  display: grid;
+  gap: 13px;
+}
+
+.clarification-question {
+  display: grid;
+  gap: 7px;
+}
+
+.clarification-question strong {
+  color: #edf3fa;
+  font-size: 13px;
+}
+
+.clarification-question small {
+  color: var(--muted);
+  line-height: 1.4;
 }
 
 .analysis-banner {
@@ -1545,6 +1663,15 @@ textarea:focus {
   font-size: 10px;
 }
 
+.recommendation-card ol {
+  display: grid;
+  gap: 4px;
+  margin: 10px 0 0;
+  padding-left: 18px;
+  color: #aebdd0;
+  font-size: 12px;
+}
+
 .proposed-step {
   border-left: 2px solid var(--line);
   padding: 4px 0 10px 12px;
@@ -1668,8 +1795,13 @@ textarea:focus {
   .detail-layout,
   .schedule-grid,
   .extraction-grid,
-  .intent-grid {
+  .intent-grid,
+  .workflow-ai-input-row {
     grid-template-columns: 1fr;
+  }
+
+  .workflow-ai-editor {
+    margin: 18px;
   }
 
   .run-panel {

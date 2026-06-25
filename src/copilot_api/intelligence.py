@@ -4,6 +4,7 @@ from copy import deepcopy
 import re
 
 from .catalog import NODE_CATALOG
+from .email_language import extract_email_search_text, has_email_reference
 from .knowledge_base import ProvenWorkflow, WorkflowKnowledgeBase
 from .models import (
     ExtractedWorkflowRequest,
@@ -24,7 +25,9 @@ APP_ALIASES = {
     "crm": "HubSpot",
     "gmail": "Gmail",
     "email": "Gmail",
+    "emails": "Gmail",
     "mail": "Gmail",
+    "mails": "Gmail",
     "inbox": "Gmail",
     "notion": "Notion",
     "teams": "Microsoft Teams",
@@ -196,7 +199,7 @@ class WorkflowIntelligenceEngine:
             workflow_type = "support_triage"
         elif "onboard" in text or "new employee" in text:
             workflow_type = "employee_onboarding"
-        elif re.search(r"\b(?:email|e-mail|mail|gmail|inbox)\b", text) and (
+        elif has_email_reference(text) and (
             extracted.tasks
             or any(
                 term in text
@@ -235,7 +238,7 @@ class WorkflowIntelligenceEngine:
         search_text = self._email_search_text(extracted.trigger)
         if "form" in trigger_text:
             nodes.append(self._node("form_submission_trigger", "Customer Form Submitted"))
-        elif re.search(r"\b(?:email|e-mail|mail|gmail|inbox|message)\b", trigger_text):
+        elif has_email_reference(trigger_text):
             gmail = self._node("gmail_trigger", "Search Gmail")
             sender = self._email_sender(extracted.trigger)
             tag = self._email_tag(extracted.trigger)
@@ -280,21 +283,20 @@ class WorkflowIntelligenceEngine:
                 if channel:
                     node.config["channel_id"] = channel
                     node.label = f"Notify {channel.title()} in Slack"
-                if re.search(
-                    r"\b(?:email|e-mail|mail|gmail|inbox)\b",
-                    extracted.trigger,
-                    re.I,
-                ):
+                if has_email_reference(extracted.trigger):
                     node.config["message_template"] = (
                         "New email from {{from}}: {{subject}}"
                     )
                     node.description = (
                         f"Send the matching email to the {channel or 'selected'} Slack channel"
                     )
-            if node_type == "notion_create_page" and re.search(
-                r"\b(?:email|mail|newsletter|details?|content|body)\b",
-                f"{extracted.trigger} {task}",
-                re.I,
+            if node_type == "notion_create_page" and (
+                has_email_reference(f"{extracted.trigger} {task}")
+                or re.search(
+                    r"\b(?:newsletter|details?|content|body)\b",
+                    f"{extracted.trigger} {task}",
+                    re.I,
+                )
             ):
                 node.config.update(
                     {
@@ -427,6 +429,121 @@ class WorkflowIntelligenceEngine:
             )
         return updated
 
+    def apply_contextual_modification(
+        self,
+        original: Workflow,
+        generated: Workflow,
+        instruction: str,
+    ) -> Workflow:
+        """Apply replacement language against the existing workflow state."""
+        if not re.search(
+            r"\b(?:instead|rather than|replace|switch|change)\b",
+            instruction,
+            re.I,
+        ):
+            return generated
+
+        extracted = ExtractedWorkflowRequest(
+            trigger="Existing workflow",
+            tasks=[self._sentence(instruction)],
+            goal="Workflow modification",
+        )
+        intent = self.understand_intent(instruction, extracted)
+        requested_type = self._task_node_type(instruction, intent)
+        notification_types = {"slack_message", "teams_message"}
+        if requested_type not in notification_types:
+            return generated
+
+        replaced = deepcopy(original)
+        existing_action = next(
+            (
+                node
+                for node in replaced.nodes
+                if node.type in notification_types
+                and node.type != requested_type
+            ),
+            None,
+        )
+        if existing_action is None:
+            if not any(node.role == "trigger" for node in original.nodes):
+                return generated
+            replaced = deepcopy(original)
+            replacement = self._node(
+                requested_type,
+                self._label_for_node_type(requested_type),
+            )
+            replacement.id = self._next_node_id(
+                {node.id for node in replaced.nodes}
+            )
+            if any(node.type == "gmail_trigger" for node in original.nodes):
+                replacement.config["message_template"] = (
+                    "New email from {{from}}: {{subject}}"
+                )
+            replaced.nodes.append(replacement)
+            trigger = next(
+                node for node in replaced.nodes if node.role == "trigger"
+            )
+            replaced.edges.append(
+                WorkflowEdge(from_=trigger.id, to=replacement.id)
+            )
+            replaced.name = (
+                f"{original.name} via Microsoft Teams"
+                if requested_type == "teams_message"
+                else f"{original.name} via Slack"
+            )
+            return replaced
+
+        generated_action = next(
+            (
+                node
+                for node in generated.nodes
+                if node.type == requested_type
+            ),
+            None,
+        )
+        replacement = deepcopy(
+            generated_action
+            or self._node(
+                requested_type,
+                self._label_for_node_type(requested_type),
+            )
+        )
+        replacement.id = existing_action.id
+        replacement.config["channel_id"] = existing_action.config.get(
+            "channel_id",
+            replacement.config.get("channel_id", "general"),
+        )
+        replacement.config["message_template"] = existing_action.config.get(
+            "message_template",
+            replacement.config.get(
+                "message_template",
+                "New workflow event received.",
+            ),
+        )
+        replacement.label = self._label_for_node_type(requested_type)
+        replacement.description = NODE_CATALOG[requested_type].description
+        replaced.nodes = [
+            replacement if node.id == existing_action.id else node
+            for node in replaced.nodes
+        ]
+        if requested_type == "teams_message":
+            replaced.name = re.sub(
+                r"\bSlack\b",
+                "Microsoft Teams",
+                original.name,
+                flags=re.I,
+            )
+            if replaced.name == original.name:
+                replaced.name = f"{original.name} via Microsoft Teams"
+        else:
+            replaced.name = re.sub(
+                r"\bMicrosoft Teams\b|\bTeams\b",
+                "Slack",
+                original.name,
+                flags=re.I,
+            )
+        return replaced
+
     def repair_legacy_email_workflow(self, workflow: Workflow) -> bool:
         if not workflow.nodes or workflow.nodes[0].type != "webhook":
             return False
@@ -436,7 +553,7 @@ class WorkflowIntelligenceEngine:
             for value in (trigger_node.label, trigger_node.description)
             if value
         )
-        if not re.search(r"\b(?:email|e-mail|mail|gmail|inbox)\b", trigger_text, re.I):
+        if not has_email_reference(trigger_text):
             return False
 
         search_text = self._email_search_text(trigger_node.label or trigger_text)
@@ -486,6 +603,7 @@ class WorkflowIntelligenceEngine:
             config["description_template"] = "{{message}} Contact: {{email}}"
         return WorkflowNode(
             type=node_type,
+            role=definition.role,
             label=label,
             description=definition.description,
             config=config,
@@ -499,7 +617,7 @@ class WorkflowIntelligenceEngine:
             return "Customer support"
         if any(term in lowered for term in ("employee", "onboarding", "candidate")):
             return "Employee onboarding"
-        if re.search(r"\b(?:email|e-mail|mail|gmail|inbox)\b", lowered) and "task" in lowered:
+        if has_email_reference(lowered) and "task" in lowered:
             return "Email follow-up"
         return "Process automation"
 
@@ -510,10 +628,9 @@ class WorkflowIntelligenceEngine:
             self._task_node_type(task, intent)
             for task in extracted.tasks
         ]
-        if "notion_create_page" in task_types and re.search(
-            r"\b(?:email|e-mail|mail|gmail|inbox|newsletter)\b",
-            extracted.trigger,
-            re.I,
+        if "notion_create_page" in task_types and (
+            has_email_reference(extracted.trigger)
+            or re.search(r"\bnewsletter\b", extracted.trigger, re.I)
         ):
             search_text = self._email_search_text(extracted.trigger)
             return (
@@ -521,10 +638,8 @@ class WorkflowIntelligenceEngine:
                 if search_text
                 else "Emails to Notion"
             )
-        if "slack_message" in task_types and re.search(
-            r"\b(?:email|e-mail|mail|gmail|inbox)\b",
-            extracted.trigger,
-            re.I,
+        if "slack_message" in task_types and has_email_reference(
+            extracted.trigger
         ):
             sender = self._email_sender(extracted.trigger)
             channel = next(
@@ -552,25 +667,7 @@ class WorkflowIntelligenceEngine:
         return names.get(intent.workflow_type, extracted.goal)
 
     def _email_search_text(self, value: str) -> str:
-        patterns = (
-            r"""(?:word|phrase|containing|contains|with)\s+["']([^"']+)["']""",
-            r"\b(?:related to|about|regarding)\s+(.+)$",
-            r"\b(?:emails?|e-mails?|mail|gmail|inbox)\s+for\s+"
-            r"(?!emails?\b|e-mails?\b|mail\b)(.+)$",
-        )
-        for pattern in patterns:
-            match = re.search(pattern, value, re.I)
-            if match:
-                search_text = re.sub(r"\s+", " ", match.group(1)).strip(" .,")
-                if search_text.lower() in {
-                    "newletter",
-                    "newletters",
-                    "newsletter",
-                    "newsletters",
-                }:
-                    return "newsletter"
-                return search_text
-        return ""
+        return extract_email_search_text(value)
 
     def _email_sender(self, value: str) -> str:
         match = re.search(r"\bfrom\s+(.+)$", value, re.I)
@@ -613,10 +710,10 @@ class WorkflowIntelligenceEngine:
             return "reminder_create"
         if "task" in lowered:
             return "task_create"
-        if re.search(r"\b(?:send|reply|respond|forward)\b", lowered) and re.search(
-            r"\b(?:email|e-mail|mail)\b",
+        if re.search(
+            r"\b(?:send|reply|respond|forward)\b",
             lowered,
-        ):
+        ) and has_email_reference(lowered):
             return "email_send"
         return None
 
@@ -633,10 +730,10 @@ class WorkflowIntelligenceEngine:
         }[node_type]
 
     def _looks_like_trigger(self, value: str) -> bool:
-        return bool(
+        return has_email_reference(value) or bool(
             re.search(
-                r"\b(?:check|search|monitor|watch|read|find|receive|get|email|mail|"
-                r"inbox|calendar|event|form|webhook)\b",
+                r"\b(?:check|search|monitor|watch|read|find|receive|get|"
+                r"calendar|event|form|webhook)\b",
                 value,
                 re.I,
             )

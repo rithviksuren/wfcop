@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import (
+    Conversation,
+    ConversationTurn,
     TeamMember,
     TeamRole,
     Workflow,
+    WorkflowPlanSession,
     WorkflowPermission,
     WorkflowPermissionGrant,
     WorkflowPermissionSummary,
@@ -21,18 +25,29 @@ from .models import (
 
 
 class WorkflowRepository:
-    def __init__(self, db_path: str = "data/workflows.sqlite3") -> None:
+    def __init__(self, db_path: str | None = None) -> None:
+        db_path = db_path or os.getenv(
+            "FLOWMIND_DATABASE_PATH",
+            "data/workflows.sqlite3",
+        )
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(
+            self.db_path,
+            timeout=10,
+        )
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 10000")
         return connection
 
     def _initialize(self) -> None:
         with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = NORMAL")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS workflows (
@@ -135,6 +150,75 @@ class WorkflowRepository:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    workflow_id TEXT,
+                    title TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(workflow_id) REFERENCES workflows(id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_turns (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(conversation_id, sequence),
+                    FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workflow_plan_sessions (
+                    id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_workflows_updated_at "
+                "ON workflows(updated_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_workflow_runs_workflow_started "
+                "ON workflow_runs(workflow_id, started_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_workflow_tasks_workflow_created "
+                "ON workflow_tasks(workflow_id, created_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires_at "
+                "ON auth_sessions(expires_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conversations_owner_updated "
+                "ON conversations(owner_id, updated_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conversation_turns_sequence "
+                "ON conversation_turns(conversation_id, sequence)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_plan_sessions_owner_updated "
+                "ON workflow_plan_sessions(owner_id, updated_at DESC)"
+            )
+            connection.execute("PRAGMA user_version = 3")
 
     def save(self, workflow: Workflow) -> Workflow:
         payload = workflow.model_dump_json(by_alias=True)
@@ -172,6 +256,29 @@ class WorkflowRepository:
             exists = connection.execute("SELECT 1 FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
             if exists is None:
                 return False
+            conversation_rows = connection.execute(
+                """
+                SELECT id, payload FROM conversations
+                WHERE workflow_id = ?
+                """,
+                (workflow_id,),
+            ).fetchall()
+            for row in conversation_rows:
+                conversation = Conversation.model_validate_json(row["payload"])
+                conversation.workflow_id = None
+                conversation.updated_at = datetime.now(timezone.utc)
+                connection.execute(
+                    """
+                    UPDATE conversations
+                    SET workflow_id = NULL, payload = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        conversation.model_dump_json(),
+                        conversation.updated_at.isoformat(),
+                        conversation.id,
+                    ),
+                )
             connection.execute("DELETE FROM workflow_tasks WHERE workflow_id = ?", (workflow_id,))
             connection.execute("DELETE FROM workflow_runs WHERE workflow_id = ?", (workflow_id,))
             connection.execute("DELETE FROM workflow_member_permissions WHERE workflow_id = ?", (workflow_id,))
@@ -345,6 +452,10 @@ class WorkflowRepository:
         return None
 
     def save_run(self, run: WorkflowRun) -> WorkflowRun:
+        if self.get(run.workflow_id) is None:
+            raise ValueError(
+                f"Cannot save run {run.id}: workflow {run.workflow_id} does not exist."
+            )
         with self._connect() as connection:
             connection.execute(
                 """
@@ -394,6 +505,15 @@ class WorkflowRepository:
         return WorkflowRun.model_validate_json(row["payload"])
 
     def save_task(self, task: WorkflowTask) -> WorkflowTask:
+        if self.get(task.workflow_id) is None:
+            raise ValueError(
+                f"Cannot save task {task.id}: workflow {task.workflow_id} does not exist."
+            )
+        if self.get_run(task.workflow_id, task.run_id) is None:
+            raise ValueError(
+                f"Cannot save task {task.id}: run {task.run_id} does not exist "
+                f"for workflow {task.workflow_id}."
+            )
         with self._connect() as connection:
             connection.execute(
                 """
@@ -458,6 +578,176 @@ class WorkflowRepository:
         with self._connect() as connection:
             cursor = connection.execute("DELETE FROM integrations WHERE provider = ?", (provider,))
         return cursor.rowcount > 0
+
+    def save_conversation(
+        self,
+        conversation: Conversation,
+    ) -> Conversation:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO conversations (
+                    id, owner_id, workflow_id, title, payload,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    workflow_id = excluded.workflow_id,
+                    title = excluded.title,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    conversation.id,
+                    conversation.owner_id,
+                    conversation.workflow_id,
+                    conversation.title,
+                    conversation.model_dump_json(),
+                    conversation.created_at.isoformat(),
+                    conversation.updated_at.isoformat(),
+                ),
+            )
+        return conversation
+
+    def get_conversation(
+        self,
+        conversation_id: str,
+        owner_id: str,
+    ) -> Conversation | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload FROM conversations
+                WHERE id = ? AND owner_id = ?
+                """,
+                (conversation_id, owner_id),
+            ).fetchone()
+        return Conversation.model_validate_json(row["payload"]) if row else None
+
+    def list_conversations(self, owner_id: str) -> list[Conversation]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM conversations
+                WHERE owner_id = ?
+                ORDER BY updated_at DESC
+                """,
+                (owner_id,),
+            ).fetchall()
+        return [
+            Conversation.model_validate_json(row["payload"])
+            for row in rows
+        ]
+
+    def save_conversation_turn(
+        self,
+        turn: ConversationTurn,
+    ) -> ConversationTurn:
+        with self._connect() as connection:
+            conversation = connection.execute(
+                "SELECT 1 FROM conversations WHERE id = ?",
+                (turn.conversation_id,),
+            ).fetchone()
+            if conversation is None:
+                raise ValueError(
+                    f"Conversation {turn.conversation_id} does not exist."
+                )
+            connection.execute(
+                """
+                INSERT INTO conversation_turns (
+                    id, conversation_id, sequence, payload, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    turn.id,
+                    turn.conversation_id,
+                    turn.sequence,
+                    turn.model_dump_json(by_alias=True),
+                    turn.created_at.isoformat(),
+                ),
+            )
+        return turn
+
+    def list_conversation_turns(
+        self,
+        conversation_id: str,
+    ) -> list[ConversationTurn]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload FROM conversation_turns
+                WHERE conversation_id = ?
+                ORDER BY sequence ASC
+                """,
+                (conversation_id,),
+            ).fetchall()
+        return [
+            ConversationTurn.model_validate_json(row["payload"])
+            for row in rows
+        ]
+
+    def latest_conversation_turn(
+        self,
+        conversation_id: str,
+    ) -> ConversationTurn | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload FROM conversation_turns
+                WHERE conversation_id = ?
+                ORDER BY sequence DESC
+                LIMIT 1
+                """,
+                (conversation_id,),
+            ).fetchone()
+        return ConversationTurn.model_validate_json(row["payload"]) if row else None
+
+    def save_plan_session(
+        self,
+        session: WorkflowPlanSession,
+    ) -> WorkflowPlanSession:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO workflow_plan_sessions (
+                    id, owner_id, status, payload, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status = excluded.status,
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    session.id,
+                    session.owner_id,
+                    session.status,
+                    session.model_dump_json(),
+                    session.created_at.isoformat(),
+                    session.updated_at.isoformat(),
+                ),
+            )
+        return session
+
+    def get_plan_session(
+        self,
+        session_id: str,
+        owner_id: str,
+    ) -> WorkflowPlanSession | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload FROM workflow_plan_sessions
+                WHERE id = ? AND owner_id = ?
+                """,
+                (session_id, owner_id),
+            ).fetchone()
+        return (
+            WorkflowPlanSession.model_validate_json(row["payload"])
+            if row
+            else None
+        )
 
     def save_oauth_state(self, state: str, nonce: str, ttl_minutes: int = 10) -> None:
         expires_at = datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)

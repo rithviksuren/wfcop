@@ -272,14 +272,17 @@ class WorkflowExecutor:
         children = self._notion_content_blocks(content)
         if children:
             request_payload["children"] = children
-        response = self._post_json(
-            "https://api.notion.com/v1/pages",
-            request_payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Notion-Version": self.NOTION_API_VERSION,
-            },
-        )
+        try:
+            response = self._post_json(
+                "https://api.notion.com/v1/pages",
+                request_payload,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Notion-Version": self.NOTION_API_VERSION,
+                },
+            )
+        except WorkflowExecutionError as exc:
+            raise WorkflowExecutionError(self._notion_error_message(exc)) from exc
         return NodeExecution(
             output={
                 **payload,
@@ -603,7 +606,18 @@ class WorkflowExecutor:
             or os.getenv("NOTION_DATA_SOURCE_ID")
         )
         if direct_value:
-            return self.normalize_notion_id(str(direct_value), "data source")
+            data_source_id = self.normalize_notion_id(str(direct_value), "data source")
+            try:
+                self._get_json(
+                    f"https://api.notion.com/v1/data_sources/{data_source_id}",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Notion-Version": self.NOTION_API_VERSION,
+                    },
+                )
+            except WorkflowExecutionError as exc:
+                raise WorkflowExecutionError(self._notion_error_message(exc)) from exc
+            return data_source_id
 
         legacy_value = (
             node.config.get("database_id")
@@ -633,11 +647,9 @@ class WorkflowExecutor:
                     headers=headers,
                 )
                 return database_id
-            except WorkflowExecutionError:
+            except WorkflowExecutionError as data_source_error:
                 raise WorkflowExecutionError(
-                    "The saved Notion identifier is not an accessible database or data source. "
-                    "In Notion, open the database settings, choose Manage data sources, copy the "
-                    "data source ID, and save it in Integrations."
+                    self._notion_error_message(data_source_error)
                 ) from database_error
 
         data_sources = database.get("data_sources")
@@ -662,6 +674,37 @@ class WorkflowExecutor:
             }
             self.repository.save_integration("notion", migrated)
         return data_source_id
+
+    @staticmethod
+    def _notion_error_message(error: Exception) -> str:
+        detail = str(error)
+        lowered = detail.lower()
+        if "http 404" in lowered or "object_not_found" in lowered:
+            return (
+                "Notion cannot access the selected data source. Open the database in Notion, "
+                "choose ••• → Connections, and add the same Notion integration whose token is "
+                "saved in FlowMind. If the database is in another workspace, use an integration "
+                "token from that workspace. Then verify the Data source ID in FlowMind → "
+                "Integrations → Notion and run the workflow again."
+            )
+        if "http 401" in lowered or "unauthorized" in lowered:
+            return (
+                "The saved Notion integration token is invalid or expired. Create or copy the "
+                "internal integration secret from Notion, save it again in FlowMind → "
+                "Integrations → Notion, and retry."
+            )
+        if "http 403" in lowered or "restricted_resource" in lowered:
+            return (
+                "The Notion integration does not have permission to edit this data source. "
+                "Share the database with the integration and ensure it has content insertion "
+                "capabilities, then retry."
+            )
+        if "validation_error" in lowered:
+            return (
+                "Notion rejected the page configuration. Check that the configured title "
+                "property exactly matches the database's title column, then retry."
+            )
+        return detail
 
     @staticmethod
     def normalize_notion_id(value: str, label: str = "identifier") -> str:

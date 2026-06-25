@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Literal
+import re
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 
 WorkflowStatus = Literal["draft", "active", "paused"]
@@ -33,6 +34,12 @@ IntegrationProvider = Literal[
     "salesforce",
 ]
 WorkflowPriority = Literal["low", "medium", "high"]
+ConversationTurnKind = Literal["create", "modify"]
+PlanningStatus = Literal["awaiting_clarification", "ready", "completed"]
+InstructionText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1),
+]
 
 
 class WorkflowNode(BaseModel):
@@ -70,11 +77,45 @@ class Workflow(BaseModel):
 
 
 class ValidationErrorDetail(BaseModel):
-    code: str
-    message: str
+    code: str = "validation_error"
+    message: str = "Workflow validation failed."
     node_id: str | None = None
+    node_type: str | None = None
     edge_index: int | None = None
     field: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_external_error(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        raw_node = normalized.pop("node", None)
+        raw_error = normalized.pop("error", None)
+        if raw_node and not normalized.get("node_id") and not normalized.get("node_type"):
+            node_value = str(raw_node).strip()
+            if re.match(r"^(?:node[_-]|[a-f0-9]{8,}$)", node_value, re.I):
+                normalized["node_id"] = node_value
+            else:
+                normalized["node_type"] = node_value
+        if raw_error and not normalized.get("message"):
+            normalized["message"] = str(raw_error)
+        message = str(normalized.get("message") or raw_error or "")
+        if not normalized.get("field"):
+            missing_match = re.search(
+                r"\b([a-z][a-z0-9_]*)\s+(?:is\s+)?missing\b",
+                message,
+                re.I,
+            )
+            if missing_match:
+                normalized["field"] = missing_match.group(1)
+        if not normalized.get("code"):
+            normalized["code"] = (
+                "missing_required_config"
+                if normalized.get("field") and "missing" in message.lower()
+                else "validation_error"
+            )
+        return normalized
 
 
 class ValidationResult(BaseModel):
@@ -83,25 +124,131 @@ class ValidationResult(BaseModel):
 
 
 class WorkflowOperation(BaseModel):
-    op: Literal["add_node", "update_node", "remove_node", "connect_nodes", "disconnect_nodes"]
+    op: Literal[
+        "add_node",
+        "update_node",
+        "remove_node",
+        "connect_nodes",
+        "disconnect_nodes",
+        "update_workflow",
+    ]
     node: WorkflowNode | None = None
     node_id: str | None = None
     edge: WorkflowEdge | None = None
     config: dict[str, Any] | None = None
+    changes: dict[str, Any] | None = None
     reason: str | None = None
+
+    @model_validator(mode="after")
+    def validate_operation_payload(self) -> "WorkflowOperation":
+        if self.op == "add_node" and self.node is None:
+            raise ValueError("add_node requires node.")
+        if self.op == "update_node" and (
+            self.node_id is None or self.node is None
+        ):
+            raise ValueError("update_node requires node_id and node.")
+        if self.op == "remove_node" and self.node_id is None:
+            raise ValueError("remove_node requires node_id.")
+        if self.op in {"connect_nodes", "disconnect_nodes"} and self.edge is None:
+            raise ValueError(f"{self.op} requires edge.")
+        if self.op == "update_workflow" and not self.changes:
+            raise ValueError("update_workflow requires changes.")
+        return self
+
+
+class WorkflowDiffRequest(BaseModel):
+    before: Workflow
+    after: Workflow
+
+
+class ApplyWorkflowOperationsRequest(BaseModel):
+    expected_version: int = Field(ge=1)
+    operations: list[WorkflowOperation] = Field(min_length=1)
+
+
+class WorkflowOperationsResponse(BaseModel):
+    workflow_id: str
+    base_version: int
+    target_version: int
+    operations: list[WorkflowOperation]
+    validation: ValidationResult
+    persisted: bool
+    provider: str | None = None
+    explanation: str | None = None
 
 
 class CopilotResponse(BaseModel):
+    workflow: Workflow = Field(
+        description="The complete workflow after the requested Copilot operation."
+    )
+    validation: ValidationResult = Field(
+        description="Validation status for the returned workflow."
+    )
+    operations: list[WorkflowOperation] = Field(default_factory=list)
+    explanation: str | None = Field(
+        default=None,
+        description="Human-readable explanation when the operation provides one.",
+    )
+    provider: str = Field(
+        description="Provider that generated or assisted with the result."
+    )
+
+
+class ConversationTurn(BaseModel):
+    id: str = Field(default_factory=lambda: f"turn_{uuid4().hex[:12]}")
+    conversation_id: str
+    sequence: int = Field(ge=1)
+    kind: ConversationTurnKind
+    instruction: str
     workflow: Workflow
-    validation: ValidationResult
     operations: list[WorkflowOperation] = Field(default_factory=list)
     explanation: str | None = None
     provider: str
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+
+class Conversation(BaseModel):
+    id: str = Field(default_factory=lambda: f"conv_{uuid4().hex[:12]}")
+    owner_id: str
+    title: str
+    workflow_id: str | None = None
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+
+class ConversationMessageRequest(BaseModel):
+    instruction: InstructionText
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConversationResponse(BaseModel):
+    conversation: Conversation
+    turn: ConversationTurn
+    validation: ValidationResult
+
+
+class ConversationDetail(BaseModel):
+    conversation: Conversation
+    turns: list[ConversationTurn]
 
 
 class CreateWorkflowRequest(BaseModel):
-    instruction: str
-    context: dict[str, Any] = Field(default_factory=dict)
+    instruction: InstructionText = Field(
+        description="Natural-language description of the workflow to create.",
+        examples=[
+            "When I receive an email from Stripe, send a Slack message to the finance team."
+        ],
+    )
+    context: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional business or application context.",
+    )
 
 
 class ExtractedWorkflowRequest(BaseModel):
@@ -148,29 +295,113 @@ class WorkflowAnalysisResponse(BaseModel):
     provider: str = "hybrid-rag"
 
 
-class BuildWorkflowRequest(BaseModel):
+class PlanningStep(BaseModel):
+    id: str
+    label: str
+    description: str
+    status: Literal["pending", "in_progress", "completed"]
+
+
+class ClarifyingQuestion(BaseModel):
+    id: str
+    question: str
+    reason: str
+    choices: list[str] = Field(default_factory=list)
+    required: bool = True
+
+
+class WorkflowPlanSession(BaseModel):
+    id: str = Field(default_factory=lambda: f"plan_{uuid4().hex[:12]}")
+    owner_id: str
     instruction: str
+    resolved_instruction: str | None = None
+    status: PlanningStatus
+    steps: list[PlanningStep]
+    questions: list[ClarifyingQuestion] = Field(default_factory=list)
+    answers: dict[str, str] = Field(default_factory=dict)
+    context: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+
+class WorkflowPlanResponse(BaseModel):
+    session: WorkflowPlanSession
+    analysis: WorkflowAnalysisResponse | None = None
+
+
+class ContinueWorkflowPlanRequest(BaseModel):
+    answers: dict[str, InstructionText]
+
+
+class WorkflowPlanEvent(BaseModel):
+    event: Literal[
+        "accepted",
+        "planning",
+        "clarification",
+        "analysis",
+        "validation",
+        "complete",
+        "error",
+    ]
+    message: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class BuildWorkflowRequest(BaseModel):
+    instruction: InstructionText
     workflow: Workflow
     selected_recommendation_id: str | None = None
 
 
 class ModifyWorkflowRequest(BaseModel):
-    workflow: Workflow
-    instruction: str
-    context: dict[str, Any] = Field(default_factory=dict)
+    workflow: Workflow = Field(description="Existing workflow to modify.")
+    instruction: InstructionText = Field(
+        description="Natural-language description of the requested modification.",
+        examples=["Also create a Notion page whenever an email arrives."],
+    )
+    context: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional context used to interpret the modification.",
+    )
 
 
 class FixWorkflowRequest(BaseModel):
-    workflow: Workflow
-    instruction: str = "Fix the workflow."
-    validation_errors: list[ValidationErrorDetail] = Field(default_factory=list)
-    context: dict[str, Any] = Field(default_factory=dict)
+    workflow: Workflow = Field(description="Invalid workflow to repair.")
+    instruction: InstructionText = Field(
+        default="Fix the workflow.",
+        description="Repair instruction.",
+    )
+    validation_errors: list[ValidationErrorDetail] = Field(
+        default_factory=list,
+        description=(
+            "Known validation errors. Both the canonical shape and "
+            '{"node":"slack_message","error":"channel_id missing"} are accepted.'
+        ),
+    )
+    context: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional context used to infer missing values.",
+    )
 
 
 class ExplainWorkflowRequest(BaseModel):
-    workflow: Workflow
-    instruction: str = "Explain this workflow."
-    context: dict[str, Any] = Field(default_factory=dict)
+    workflow: Workflow = Field(description="Workflow to explain.")
+    instruction: InstructionText = Field(
+        default="Explain this workflow.",
+        description="Explanation request.",
+    )
+    context: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional audience or business context.",
+    )
+
+
+class APIErrorResponse(BaseModel):
+    detail: str | list[dict[str, Any]]
 
 
 class SaveWorkflowRequest(BaseModel):

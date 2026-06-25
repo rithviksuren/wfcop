@@ -128,6 +128,95 @@ def test_fix_adds_missing_slack_channel(tmp_path):
     assert any(operation.op == "update_node" for operation in fixed.operations)
 
 
+def test_fix_accepts_external_error_shape_and_uses_workflow_context(tmp_path):
+    service = build_service(tmp_path)
+    created = service.create(
+        "When I receive an email from Stripe, send a Slack message to the finance team."
+    )
+    slack = next(
+        node for node in created.workflow.nodes if node.type == "slack_message"
+    )
+    del slack.config["channel_id"]
+    external_error = {
+        "node": "slack_message",
+        "error": "channel_id missing",
+    }
+
+    normalized = ValidationErrorDetail.model_validate(external_error)
+    assert normalized.node_type == "slack_message"
+    assert normalized.field == "channel_id"
+    assert normalized.code == "missing_required_config"
+
+    fixed = service.fix(
+        created.workflow,
+        "Fix the workflow.",
+        [external_error],
+    )
+
+    assert fixed.validation.valid
+    assert [node.type for node in fixed.workflow.nodes] == [
+        "gmail_trigger",
+        "slack_message",
+    ]
+    repaired_slack = next(
+        node for node in fixed.workflow.nodes if node.type == "slack_message"
+    )
+    assert repaired_slack.config["channel_id"] == "finance"
+    assert fixed.workflow.edges == created.workflow.edges
+    assert any(
+        operation.op == "update_node"
+        and operation.node_id == repaired_slack.id
+        for operation in fixed.operations
+    )
+
+
+def test_fix_preserves_original_graph_when_provider_drops_nodes(tmp_path):
+    class DestructiveFixProvider(LLMProvider):
+        name = "destructive-fixer"
+
+        def generate(self, task: str, payload: dict[str, Any]) -> dict[str, Any]:
+            workflow = Workflow(name="Empty repair")
+            return {
+                "workflow": workflow.model_dump(by_alias=True),
+                "provider": self.name,
+            }
+
+    service = CopilotService(
+        provider=DestructiveFixProvider(),
+        repository=WorkflowRepository(str(tmp_path / "safe-fix.sqlite3")),
+    )
+    workflow = Workflow(
+        name="Stripe Emails to Finance Slack",
+        nodes=[
+            WorkflowNode(
+                id="node_1",
+                type="gmail_trigger",
+                config={"from_contains": "Stripe", "search_text": ""},
+            ),
+            WorkflowNode(
+                id="node_2",
+                type="slack_message",
+                config={"message_template": "New email from {{from}}: {{subject}}"},
+            ),
+        ],
+        edges=[WorkflowEdge(from_="node_1", to="node_2")],
+    )
+
+    fixed = service.fix(
+        workflow,
+        "Fix the workflow.",
+        [{"node": "slack_message", "error": "channel_id missing"}],
+    )
+
+    assert fixed.validation.valid
+    assert [node.type for node in fixed.workflow.nodes] == [
+        "gmail_trigger",
+        "slack_message",
+    ]
+    assert fixed.workflow.nodes[1].config["channel_id"] == "finance"
+    assert fixed.workflow.edges == [WorkflowEdge(from_="node_1", to="node_2")]
+
+
 def test_validation_rejects_bad_edges():
     workflow = Workflow(
         nodes=[WorkflowNode(id="node_1", type="gmail_trigger", config={"from_contains": "Stripe"})],
@@ -147,7 +236,72 @@ def test_explain_returns_human_readable_text(tmp_path):
     response = service.explain(created.workflow, "Explain this workflow.")
 
     assert response.explanation
-    assert "workflow" in response.explanation.lower()
+    assert "Gmail checks for a new unread email from Stripe." in response.explanation
+    assert "It sends a Slack message to #finance" in response.explanation
+    assert "New email from {{from}}: {{subject}}" in response.explanation
+    assert response.validation.valid
+
+
+def test_explain_describes_parallel_actions_without_exposing_notion_id(tmp_path):
+    service = build_service(tmp_path)
+    created = service.create(
+        "When I receive an email from Stripe, send a Slack message to the finance team."
+    )
+    modified = service.modify(
+        created.workflow,
+        "Also create a Notion page whenever an email arrives.",
+    )
+    notion = next(
+        node for node in modified.workflow.nodes if node.type == "notion_create_page"
+    )
+    notion.config["data_source_id"] = "bc1211ca-e3f1-4939-ae34-5260b16f627c"
+
+    response = service.explain(modified.workflow, "Explain this workflow.")
+
+    assert "Actions run in parallel:" in response.explanation
+    assert "It sends a Slack message to #finance" in response.explanation
+    assert 'It creates a Notion page titled "Email: {{subject}}"' in response.explanation
+    assert "sender, recipient, date, subject, email body" in response.explanation
+    assert "bc1211ca-e3f1-4939-ae34-5260b16f627c" not in response.explanation
+
+
+def test_explain_works_when_ai_provider_is_unavailable(tmp_path):
+    class UnavailableProvider(LLMProvider):
+        name = "unavailable-ai"
+
+        def generate(self, task: str, payload: dict[str, Any]) -> dict[str, Any]:
+            raise LLMError("Provider unavailable.")
+
+    service = CopilotService(
+        provider=UnavailableProvider(),
+        repository=WorkflowRepository(str(tmp_path / "explain.sqlite3")),
+    )
+    workflow = Workflow(
+        name="Stripe Emails to Finance Slack",
+        nodes=[
+            WorkflowNode(
+                id="node_1",
+                type="gmail_trigger",
+                role="trigger",
+                config={"from_contains": "Stripe", "search_text": ""},
+            ),
+            WorkflowNode(
+                id="node_2",
+                type="slack_message",
+                config={
+                    "channel_id": "finance",
+                    "message_template": "New email from {{from}}: {{subject}}",
+                },
+            ),
+        ],
+        edges=[WorkflowEdge(from_="node_1", to="node_2")],
+    )
+
+    response = service.explain(workflow, "Explain this workflow.")
+
+    assert "Gmail checks for a new unread email from Stripe." in response.explanation
+    assert "It sends a Slack message to #finance" in response.explanation
+    assert response.provider == "unavailable-ai"
 
 
 def test_provider_falls_back_when_openai_is_rate_limited():
@@ -199,6 +353,40 @@ def test_jobs_email_instruction_generates_precise_scheduled_workflow(tmp_path):
     }
     assert workflow.nodes[2].config["title_template"] == "Email follow-up: {{subject}}"
     assert "Jobs" in workflow.name
+
+
+def test_job_related_mails_match_email_text_containing_job(tmp_path):
+    service = build_service(tmp_path)
+
+    created = service.create(
+        "When I receive job-related mails, create a task in our task list."
+    )
+
+    workflow = created.workflow
+    assert [node.type for node in workflow.nodes] == [
+        "gmail_trigger",
+        "filter_condition",
+        "task_create",
+    ]
+    assert workflow.nodes[0].config["search_text"] == "job"
+    assert workflow.nodes[1].config["value"] == "job"
+
+    run = service.run_workflow(
+        workflow,
+        input_payload={
+            "email": {
+                "from": "recruiter@example.com",
+                "subject": "A new job opening",
+                "body": "This role matches your profile.",
+            }
+        },
+    )
+
+    assert run.status == "success"
+    assert run.steps[1].output["condition"]["matched"] is True
+    assert run.steps[2].output["created_task"]["title"] == (
+        "Email follow-up: A new job opening"
+    )
 
 
 def test_service_repairs_incomplete_ai_workflow(tmp_path):

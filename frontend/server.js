@@ -1,6 +1,7 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const { spawn } = require("child_process");
 
 const projectRoot = path.resolve(__dirname, "..");
 const staticRoot = path.join(projectRoot, "src", "copilot_api", "static");
@@ -28,6 +29,26 @@ const frontendHost = process.env.FRONTEND_HOST || "127.0.0.1";
 const frontendPort = Number(process.env.FRONTEND_PORT || 3000);
 const backendHost = process.env.BACKEND_HOST || "127.0.0.1";
 const backendPort = Number(process.env.BACKEND_PORT || 8000);
+
+function openBrowser(url) {
+  const commands = {
+    darwin: ["open", [url]],
+    linux: ["xdg-open", [url]],
+    win32: ["cmd", ["/c", "start", "", url]],
+  };
+  const command = commands[process.platform];
+  if (!command) return;
+
+  const browser = spawn(command[0], command[1], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  browser.on("error", () => {
+    console.warn(`Could not open the browser automatically. Open ${url} manually.`);
+  });
+  browser.unref();
+}
 
 const contentTypes = {
   ".css": "text/css; charset=utf-8",
@@ -119,6 +140,9 @@ const server = http.createServer((request, response) => {
 });
 
 server.listen(frontendPort, frontendHost, () => {
-  console.log(`Frontend: http://${frontendHost}:${frontendPort}`);
+  const browserHost = ["0.0.0.0", "::"].includes(frontendHost) ? "localhost" : frontendHost;
+  const frontendUrl = `http://${browserHost}:${frontendPort}`;
+  console.log(`Frontend: ${frontendUrl}`);
   console.log(`Proxying API requests to http://${backendHost}:${backendPort}`);
+  openBrowser(frontendUrl);
 });

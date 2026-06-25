@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 
 from .auth import GoogleOAuth, GoogleOAuthError
@@ -12,9 +20,16 @@ from .catalog import catalog_for_prompt
 from .executor import WorkflowExecutionError, WorkflowExecutor
 from .llm import LLMError, build_provider
 from .models import (
+    ApplyWorkflowOperationsRequest,
     AuthStatus,
     AuthUser,
+    APIErrorResponse,
     BuildWorkflowRequest,
+    ContinueWorkflowPlanRequest,
+    Conversation,
+    ConversationDetail,
+    ConversationMessageRequest,
+    ConversationResponse,
     CopilotResponse,
     CreateWorkflowRequest,
     ExplainWorkflowRequest,
@@ -32,17 +47,49 @@ from .models import (
     ValidationResult,
     Workflow,
     WorkflowAnalysisResponse,
+    WorkflowDiffRequest,
+    WorkflowOperationsResponse,
+    WorkflowPlanEvent,
+    WorkflowPlanResponse,
     WorkflowPermissionSummary,
     WorkflowRun,
     WorkflowSummary,
     WorkflowTask,
     WorkflowTaskSummary,
 )
+from .diff import apply_workflow_operations, diff_workflows
 from .repository import WorkflowRepository
 from .service import CopilotService
 from .validation import validate_workflow
 
-app = FastAPI(title="AI Workflow Copilot", version="0.1.0")
+API_VERSION = "0.2.0"
+API_FEATURES = [
+    "workflow_create",
+    "workflow_modify",
+    "workflow_fix",
+    "workflow_explain",
+    "workflow_validation",
+    "workflow_persistence",
+    "workflow_diffing",
+    "conversation_memory",
+    "tool_calling",
+    "multi_step_planning",
+    "streaming_responses",
+]
+
+app = FastAPI(
+    title="AI Workflow Copilot",
+    version=API_VERSION,
+    description=(
+        "Create, modify, repair, explain, persist, and execute automation workflows."
+    ),
+    openapi_tags=[
+        {
+            "name": "Copilot",
+            "description": "Natural-language workflow design and maintenance.",
+        }
+    ],
+)
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 repository = WorkflowRepository()
@@ -239,8 +286,13 @@ def logout(request: Request) -> Response:
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "provider": provider.name}
+def health() -> dict[str, object]:
+    return {
+        "status": "ok",
+        "api_version": API_VERSION,
+        "provider": provider.name,
+        "features": API_FEATURES,
+    }
 
 
 @app.get("/nodes")
@@ -318,7 +370,32 @@ def delete_integration(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@app.post("/copilot/create", response_model=CopilotResponse)
+COPILOT_ERROR_RESPONSES = {
+    401: {"model": APIErrorResponse, "description": "Authentication required."},
+    422: {"model": APIErrorResponse, "description": "Invalid request or workflow."},
+    502: {"model": APIErrorResponse, "description": "AI provider unavailable."},
+}
+OPERATION_ERROR_RESPONSES = {
+    **COPILOT_ERROR_RESPONSES,
+    409: {
+        "model": APIErrorResponse,
+        "description": "Workflow version conflict.",
+    },
+}
+
+
+@app.post(
+    "/copilot/create",
+    response_model=CopilotResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Copilot"],
+    summary="Create a workflow",
+    description=(
+        "Generates, validates, assigns ownership to, and persists a workflow from "
+        "a natural-language instruction."
+    ),
+    responses=COPILOT_ERROR_RESPONSES,
+)
 def create_workflow(
     request: CreateWorkflowRequest,
     copilot: CopilotService = Depends(get_service),
@@ -328,9 +405,405 @@ def create_workflow(
         return copilot.create(request.instruction, request.context, user_id=x_user_id)
     except LLMError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@app.post("/copilot/analyze", response_model=WorkflowAnalysisResponse)
+@app.post(
+    "/copilot/plans",
+    response_model=WorkflowPlanResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Copilot"],
+    summary="Plan a workflow request",
+    description=(
+        "Creates a durable multi-step plan. Broad requests return focused "
+        "clarifying questions; sufficiently specific requests return analysis."
+    ),
+    responses=COPILOT_ERROR_RESPONSES,
+)
+def plan_workflow_request(
+    request: CreateWorkflowRequest,
+    copilot: CopilotService = Depends(get_service),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> WorkflowPlanResponse:
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Sign in is required.")
+    return copilot.plan(
+        request.instruction,
+        x_user_id,
+        request.context,
+    )
+
+
+@app.post(
+    "/copilot/plans/{session_id}/answers",
+    response_model=WorkflowPlanResponse,
+    tags=["Copilot"],
+    summary="Answer workflow planning questions",
+    description=(
+        "Continues a durable plan with clarification answers and generates the "
+        "workflow analysis once all required decisions are resolved."
+    ),
+    responses=COPILOT_ERROR_RESPONSES,
+)
+def continue_workflow_plan(
+    session_id: str,
+    request: ContinueWorkflowPlanRequest,
+    copilot: CopilotService = Depends(get_service),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> WorkflowPlanResponse:
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Sign in is required.")
+    try:
+        return copilot.continue_plan(
+            session_id,
+            request.answers,
+            x_user_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get(
+    "/copilot/plans/{session_id}",
+    response_model=WorkflowPlanResponse,
+    tags=["Copilot"],
+    summary="Get a workflow plan",
+    responses=COPILOT_ERROR_RESPONSES,
+)
+def get_workflow_plan(
+    session_id: str,
+    copilot: CopilotService = Depends(get_service),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> WorkflowPlanResponse:
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Sign in is required.")
+    try:
+        return copilot.get_plan(session_id, x_user_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post(
+    "/copilot/plans/stream",
+    response_class=StreamingResponse,
+    tags=["Copilot"],
+    summary="Stream workflow planning progress",
+    description=(
+        "Streams Server-Sent Events for acceptance, planning, clarification or "
+        "analysis, validation, and completion."
+    ),
+    responses=COPILOT_ERROR_RESPONSES,
+)
+def stream_workflow_plan(
+    request: CreateWorkflowRequest,
+    copilot: CopilotService = Depends(get_service),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> StreamingResponse:
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Sign in is required.")
+
+    def events() -> Iterator[str]:
+        yield _sse_event(
+            WorkflowPlanEvent(
+                event="accepted",
+                message="Workflow request accepted.",
+                data={"instruction": request.instruction},
+            )
+        )
+        yield _sse_event(
+            WorkflowPlanEvent(
+                event="planning",
+                message="Analyzing scope and missing decisions.",
+            )
+        )
+        try:
+            result = copilot.plan(
+                request.instruction,
+                x_user_id,
+                request.context,
+            )
+            if result.session.status == "awaiting_clarification":
+                yield _sse_event(
+                    WorkflowPlanEvent(
+                        event="clarification",
+                        message="Clarification is required before generation.",
+                        data={
+                            "session_id": result.session.id,
+                            "questions": [
+                                question.model_dump(mode="json")
+                                for question in result.session.questions
+                            ],
+                        },
+                    )
+                )
+            else:
+                yield _sse_event(
+                    WorkflowPlanEvent(
+                        event="analysis",
+                        message="Workflow analysis and graph generated.",
+                        data={
+                            "session_id": result.session.id,
+                            "analysis": result.analysis.model_dump(
+                                mode="json",
+                                by_alias=True,
+                            )
+                            if result.analysis
+                            else None,
+                        },
+                    )
+                )
+                yield _sse_event(
+                    WorkflowPlanEvent(
+                        event="validation",
+                        message="Generated workflow passed planning validation.",
+                        data={
+                            "valid": validate_workflow(
+                                result.analysis.proposed_workflow
+                            ).valid
+                            if result.analysis
+                            else False,
+                        },
+                    )
+                )
+            yield _sse_event(
+                WorkflowPlanEvent(
+                    event="complete",
+                    message="Planning step completed.",
+                    data={
+                        "session": result.session.model_dump(mode="json")
+                    },
+                )
+            )
+        except Exception as exc:
+            yield _sse_event(
+                WorkflowPlanEvent(
+                    event="error",
+                    message=str(exc),
+                )
+            )
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post(
+    "/copilot/plans/{session_id}/answers/stream",
+    response_class=StreamingResponse,
+    tags=["Copilot"],
+    summary="Stream workflow generation after clarification",
+    responses=COPILOT_ERROR_RESPONSES,
+)
+def stream_workflow_plan_answers(
+    session_id: str,
+    request: ContinueWorkflowPlanRequest,
+    copilot: CopilotService = Depends(get_service),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> StreamingResponse:
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Sign in is required.")
+
+    def events() -> Iterator[str]:
+        yield _sse_event(
+            WorkflowPlanEvent(
+                event="accepted",
+                message="Clarification answers accepted.",
+                data={"session_id": session_id},
+            )
+        )
+        yield _sse_event(
+            WorkflowPlanEvent(
+                event="planning",
+                message="Resolving answers into a concrete workflow request.",
+            )
+        )
+        try:
+            result = copilot.continue_plan(
+                session_id,
+                request.answers,
+                x_user_id,
+            )
+            if result.session.status == "awaiting_clarification":
+                yield _sse_event(
+                    WorkflowPlanEvent(
+                        event="clarification",
+                        message="Additional required answers are missing.",
+                        data={
+                            "questions": [
+                                question.model_dump(mode="json")
+                                for question in result.session.questions
+                            ]
+                        },
+                    )
+                )
+            else:
+                yield _sse_event(
+                    WorkflowPlanEvent(
+                        event="analysis",
+                        message="Workflow graph generated from clarified requirements.",
+                        data={
+                            "analysis": result.analysis.model_dump(
+                                mode="json",
+                                by_alias=True,
+                            )
+                            if result.analysis
+                            else None
+                        },
+                    )
+                )
+                yield _sse_event(
+                    WorkflowPlanEvent(
+                        event="validation",
+                        message="Generated workflow validated.",
+                        data={
+                            "valid": validate_workflow(
+                                result.analysis.proposed_workflow
+                            ).valid
+                            if result.analysis
+                            else False
+                        },
+                    )
+                )
+            yield _sse_event(
+                WorkflowPlanEvent(
+                    event="complete",
+                    message="Planning step completed.",
+                    data={
+                        "session": result.session.model_dump(mode="json")
+                    },
+                )
+            )
+        except Exception as exc:
+            yield _sse_event(
+                WorkflowPlanEvent(event="error", message=str(exc))
+            )
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post(
+    "/copilot/conversations",
+    response_model=ConversationResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Copilot"],
+    summary="Start a workflow conversation",
+    description=(
+        "Creates a workflow and stores the instruction, validated workflow "
+        "snapshot, and provider result as the first durable conversation turn."
+    ),
+    responses=COPILOT_ERROR_RESPONSES,
+)
+def start_copilot_conversation(
+    request: ConversationMessageRequest,
+    copilot: CopilotService = Depends(get_service),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> ConversationResponse:
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Sign in is required.")
+    try:
+        return copilot.start_conversation(
+            request.instruction,
+            x_user_id,
+            request.context,
+        )
+    except LLMError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/copilot/conversations/{conversation_id}/messages",
+    response_model=ConversationResponse,
+    tags=["Copilot"],
+    summary="Continue a workflow conversation",
+    description=(
+        "Uses the conversation's latest persisted workflow and recent turns to "
+        "interpret a follow-up instruction, then stores the new workflow snapshot."
+    ),
+    responses=COPILOT_ERROR_RESPONSES,
+)
+def continue_copilot_conversation(
+    conversation_id: str,
+    request: ConversationMessageRequest,
+    copilot: CopilotService = Depends(get_service),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> ConversationResponse:
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Sign in is required.")
+    try:
+        return copilot.continue_conversation(
+            conversation_id,
+            request.instruction,
+            x_user_id,
+            request.context,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except LLMError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get(
+    "/copilot/conversations",
+    response_model=list[Conversation],
+    tags=["Copilot"],
+    summary="List workflow conversations",
+    responses=COPILOT_ERROR_RESPONSES,
+)
+def list_copilot_conversations(
+    copilot: CopilotService = Depends(get_service),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> list[Conversation]:
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Sign in is required.")
+    return copilot.list_conversations(x_user_id)
+
+
+@app.get(
+    "/copilot/conversations/{conversation_id}",
+    response_model=ConversationDetail,
+    tags=["Copilot"],
+    summary="Get workflow conversation memory",
+    responses=COPILOT_ERROR_RESPONSES,
+)
+def get_copilot_conversation(
+    conversation_id: str,
+    copilot: CopilotService = Depends(get_service),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> ConversationDetail:
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Sign in is required.")
+    try:
+        return copilot.get_conversation(conversation_id, x_user_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post(
+    "/copilot/analyze",
+    response_model=WorkflowAnalysisResponse,
+    tags=["Copilot"],
+    summary="Analyze a workflow request",
+    responses=COPILOT_ERROR_RESPONSES,
+)
 def analyze_workflow(
     request: CreateWorkflowRequest,
     copilot: CopilotService = Depends(get_service),
@@ -338,7 +811,14 @@ def analyze_workflow(
     return copilot.analyze(request.instruction)
 
 
-@app.post("/copilot/build", response_model=Workflow)
+@app.post(
+    "/copilot/build",
+    response_model=Workflow,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Copilot"],
+    summary="Build an approved workflow plan",
+    responses=COPILOT_ERROR_RESPONSES,
+)
 def build_analyzed_workflow(
     request: BuildWorkflowRequest,
     copilot: CopilotService = Depends(get_service),
@@ -354,7 +834,17 @@ def build_analyzed_workflow(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@app.post("/copilot/modify", response_model=CopilotResponse)
+@app.post(
+    "/copilot/modify",
+    response_model=CopilotResponse,
+    tags=["Copilot"],
+    summary="Modify a workflow",
+    description=(
+        "Applies a natural-language change while preserving unrelated valid steps, "
+        "then validates and persists the updated workflow."
+    ),
+    responses=COPILOT_ERROR_RESPONSES,
+)
 def modify_workflow(
     request: ModifyWorkflowRequest,
     copilot: CopilotService = Depends(get_service),
@@ -368,7 +858,66 @@ def modify_workflow(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@app.post("/copilot/fix", response_model=CopilotResponse)
+@app.post(
+    "/copilot/modify/operations",
+    response_model=WorkflowOperationsResponse,
+    tags=["Copilot"],
+    summary="Modify a workflow and return operations only",
+    description=(
+        "Applies and persists a Copilot modification while returning a compact "
+        "semantic patch instead of the complete workflow payload."
+    ),
+    responses=OPERATION_ERROR_RESPONSES,
+)
+def modify_workflow_operations(
+    request: ModifyWorkflowRequest,
+    copilot: CopilotService = Depends(get_service),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> WorkflowOperationsResponse:
+    stored_workflow = _get_workflow_or_404(request.workflow.id)
+    _require_workflow_permission(stored_workflow, x_user_id, "edit_run")
+    if stored_workflow.version != request.workflow.version:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Workflow version conflict: expected {request.workflow.version}, "
+                f"current version is {stored_workflow.version}."
+            ),
+        )
+    try:
+        result = copilot.modify(
+            stored_workflow,
+            request.instruction,
+            request.context,
+            user_id=x_user_id,
+        )
+        return WorkflowOperationsResponse(
+            workflow_id=result.workflow.id,
+            base_version=stored_workflow.version,
+            target_version=result.workflow.version,
+            operations=result.operations,
+            validation=result.validation,
+            persisted=True,
+            provider=result.provider,
+            explanation=result.explanation,
+        )
+    except LLMError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/copilot/fix",
+    response_model=CopilotResponse,
+    tags=["Copilot"],
+    summary="Repair an invalid workflow",
+    description=(
+        "Repairs validation failures using the supplied errors, workflow context, "
+        "and safe catalog defaults."
+    ),
+    responses=COPILOT_ERROR_RESPONSES,
+)
 def fix_workflow(
     request: FixWorkflowRequest,
     copilot: CopilotService = Depends(get_service),
@@ -378,9 +927,21 @@ def fix_workflow(
         return copilot.fix(request.workflow, request.instruction, request.validation_errors, request.context, user_id=x_user_id)
     except LLMError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@app.post("/copilot/explain", response_model=CopilotResponse)
+@app.post(
+    "/copilot/explain",
+    response_model=CopilotResponse,
+    tags=["Copilot"],
+    summary="Explain a workflow",
+    description=(
+        "Returns a deterministic, graph-aware explanation without exposing secrets "
+        "or integration identifiers."
+    ),
+    responses=COPILOT_ERROR_RESPONSES,
+)
 def explain_workflow(request: ExplainWorkflowRequest, copilot: CopilotService = Depends(get_service)) -> CopilotResponse:
     try:
         return copilot.explain(request.workflow, request.instruction, request.context)
@@ -395,11 +956,47 @@ def save_workflow(
     validation = validate_workflow(request.workflow)
     if not validation.valid:
         raise HTTPException(status_code=422, detail=[error.model_dump() for error in validation.errors])
-    if x_user_id and request.workflow.owner_id is None:
+    existing = repository.get(request.workflow.id)
+    if existing is not None:
+        _require_workflow_permission(existing, x_user_id, "edit_run")
+        request.workflow.owner_id = existing.owner_id
+        request.workflow.created_by = existing.created_by
+        request.workflow.created_at = existing.created_at
+        request.workflow.version = max(
+            request.workflow.version,
+            existing.version + 1,
+        )
+    elif x_user_id:
         request.workflow.owner_id = x_user_id
         request.workflow.created_by = x_user_id
-        request.workflow.updated_by = x_user_id
+    request.workflow.updated_by = x_user_id or request.workflow.updated_by
+    request.workflow.updated_at = datetime.now(timezone.utc)
     return repository.save(request.workflow)
+
+
+@app.post(
+    "/workflows/diff",
+    response_model=WorkflowOperationsResponse,
+    tags=["Workflows"],
+    summary="Calculate a workflow patch",
+    description=(
+        "Returns deterministic operations that transform the before workflow "
+        "into the after workflow without persisting either payload."
+    ),
+    responses=COPILOT_ERROR_RESPONSES,
+)
+def calculate_workflow_diff(
+    request: WorkflowDiffRequest,
+) -> WorkflowOperationsResponse:
+    validation = validate_workflow(request.after)
+    return WorkflowOperationsResponse(
+        workflow_id=request.after.id,
+        base_version=request.before.version,
+        target_version=request.after.version,
+        operations=diff_workflows(request.before, request.after),
+        validation=validation,
+        persisted=False,
+    )
 
 
 @app.get("/workflows", response_model=list[WorkflowSummary])
@@ -417,10 +1014,12 @@ def list_workflows(
 def get_workflow(
     workflow_id: str,
     copilot: CopilotService = Depends(get_service),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
 ) -> Workflow:
     workflow = repository.get(workflow_id)
     if workflow is None:
         raise HTTPException(status_code=404, detail="Workflow not found.")
+    _require_workflow_permission(workflow, x_user_id, "run")
     return copilot.repair_legacy_workflow(workflow)
 
 
@@ -437,6 +1036,60 @@ def update_workflow(
         return copilot.update_workflow(workflow, request, user_id=x_user_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.patch(
+    "/workflows/{workflow_id}/operations",
+    response_model=WorkflowOperationsResponse,
+    tags=["Workflows"],
+    summary="Apply workflow operations",
+    description=(
+        "Applies a semantic patch using optimistic version checking, validates "
+        "the result, and persists it without returning the full workflow."
+    ),
+    responses=OPERATION_ERROR_RESPONSES,
+)
+def apply_workflow_patch(
+    workflow_id: str,
+    request: ApplyWorkflowOperationsRequest,
+    copilot: CopilotService = Depends(get_service),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> WorkflowOperationsResponse:
+    workflow = _get_workflow_or_404(workflow_id)
+    _require_workflow_permission(workflow, x_user_id, "edit_run")
+    if workflow.version != request.expected_version:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Workflow version conflict: expected {request.expected_version}, "
+                f"current version is {workflow.version}."
+            ),
+        )
+    try:
+        patched = apply_workflow_operations(workflow, request.operations)
+        stored = copilot.update_workflow(
+            workflow,
+            UpdateWorkflowRequest(
+                name=patched.name,
+                status=patched.status,
+                visibility=patched.visibility,
+                mode=patched.mode,
+                trigger_schedule=patched.trigger_schedule,
+                nodes=patched.nodes,
+                edges=patched.edges,
+            ),
+            user_id=x_user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return WorkflowOperationsResponse(
+        workflow_id=stored.id,
+        base_version=request.expected_version,
+        target_version=stored.version,
+        operations=request.operations,
+        validation=validate_workflow(stored),
+        persisted=True,
+    )
 
 
 @app.delete("/workflows/{workflow_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -498,7 +1151,10 @@ def run_workflow(
 ) -> WorkflowRun:
     workflow = _get_workflow_or_404(workflow_id)
     _require_workflow_permission(workflow, x_user_id, "run")
-    return copilot.run_workflow(workflow, request.trigger_type, request.input)
+    try:
+        return copilot.run_workflow(workflow, request.trigger_type, request.input)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/workflows/{workflow_id}/runs", response_model=list[WorkflowRun])
@@ -637,3 +1293,14 @@ def _require_workflow_permission(workflow: Workflow, user_id: str | None, requir
     if user_id is None:
         return
     raise HTTPException(status_code=403, detail="You do not have permission for this workflow.")
+
+
+def _sse_event(event: WorkflowPlanEvent) -> str:
+    payload = json.dumps(
+        {
+            "message": event.message,
+            "data": event.data,
+        },
+        separators=(",", ":"),
+    )
+    return f"event: {event.event}\ndata: {payload}\n\n"

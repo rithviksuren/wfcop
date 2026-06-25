@@ -8,6 +8,7 @@ from typing import Any
 class NodeDefinition:
     type: str
     description: str
+    role: str = "action"
     required_config: tuple[str, ...] = ()
     defaults: dict[str, Any] = field(default_factory=dict)
 
@@ -16,12 +17,14 @@ NODE_CATALOG: dict[str, NodeDefinition] = {
     "gmail_trigger": NodeDefinition(
         type="gmail_trigger",
         description="Finds a new unread email, optionally searching for specific text",
+        role="trigger",
         required_config=("from_contains",),
         defaults={"from_contains": "any sender", "search_text": ""},
     ),
     "calendar_event_trigger": NodeDefinition(
         type="calendar_event_trigger",
         description="Checks Google Calendar for upcoming events",
+        role="trigger",
         required_config=("calendar_id", "lookahead_minutes"),
         defaults={"calendar_id": "primary", "lookahead_minutes": 60},
     ),
@@ -34,6 +37,7 @@ NODE_CATALOG: dict[str, NodeDefinition] = {
     "filter_condition": NodeDefinition(
         type="filter_condition",
         description="Continue only when a field or the combined email text matches",
+        role="condition",
         required_config=("field", "operator", "value"),
         defaults={"field": "tag", "operator": "equals", "value": "urgent"},
     ),
@@ -62,6 +66,7 @@ NODE_CATALOG: dict[str, NodeDefinition] = {
     "webhook": NodeDefinition(
         type="webhook",
         description="Receive HTTP requests",
+        role="trigger",
         required_config=("path",),
         defaults={"path": "/webhooks/default"},
     ),
@@ -74,6 +79,7 @@ NODE_CATALOG: dict[str, NodeDefinition] = {
     "form_submission_trigger": NodeDefinition(
         type="form_submission_trigger",
         description="Starts when a customer submits a form",
+        role="trigger",
         required_config=("form_id",),
         defaults={"form_id": "any"},
     ),
@@ -111,6 +117,7 @@ def catalog_for_prompt() -> list[dict[str, Any]]:
         {
             "type": definition.type,
             "description": definition.description,
+            "role": definition.role,
             "required_config": list(definition.required_config),
             "defaults": definition.defaults,
         }
