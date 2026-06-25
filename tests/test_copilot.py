@@ -329,6 +329,27 @@ def test_fallback_understands_calendar_reminder_workflows():
     assert [node.type for node in workflow.nodes] == ["calendar_event_trigger", "reminder_create"]
 
 
+def test_fallback_treats_google_calendar_event_creation_as_action():
+    provider = HeuristicProvider()
+
+    result = provider.generate(
+        "create",
+        {
+            "instruction": (
+                "When I receive job-related mails, create a new event in google calendar"
+            )
+        },
+    )
+
+    workflow = Workflow.model_validate(result["workflow"])
+    assert [node.type for node in workflow.nodes] == [
+        "gmail_trigger",
+        "filter_condition",
+        "calendar_event_create",
+    ]
+    assert validate_workflow(workflow).valid
+
+
 def test_jobs_email_instruction_generates_precise_scheduled_workflow(tmp_path):
     service = build_service(tmp_path)
 

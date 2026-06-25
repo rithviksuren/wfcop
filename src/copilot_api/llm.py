@@ -755,7 +755,12 @@ class HeuristicProvider(LLMProvider):
     def _nodes_for_instruction(self, instruction: str) -> list[WorkflowNode]:
         text = instruction.lower()
         nodes: list[WorkflowNode] = []
-        if "calendar" in text or "event" in text:
+        creates_calendar_event = bool(
+            ("calendar" in text or "event" in text)
+            and re.search(r"\b(?:create|add|schedule|make|set)\b", text)
+            and "reminder" not in text
+        )
+        if ("calendar" in text or "event" in text) and not creates_calendar_event:
             nodes.append(self._node("calendar_event_trigger", f"node_{len(nodes) + 1}"))
         if any(term in text for term in ("email", "gmail", "stripe")):
             sender = "Stripe" if "stripe" in text else "any sender"
@@ -771,6 +776,8 @@ class HeuristicProvider(LLMProvider):
             nodes.append(self._node("task_create", f"node_{len(nodes) + 1}"))
         if "reminder" in text or "remind" in text:
             nodes.append(self._node("reminder_create", f"node_{len(nodes) + 1}"))
+        if creates_calendar_event:
+            nodes.append(self._node("calendar_event_create", f"node_{len(nodes) + 1}"))
         if "slack" in text or "finance team" in text:
             channel = self._channel_from_text(text)
             nodes.append(

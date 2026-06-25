@@ -40,6 +40,7 @@ APP_INTEGRATIONS = {
     "HubSpot": "hubspot",
     "Gmail": "gmail",
     "Notion": "notion",
+    "Google Calendar": "google_calendar",
     "Microsoft Teams": "teams",
 }
 
@@ -134,35 +135,44 @@ class WorkflowIntelligenceEngine:
             trigger = self._sentence(trigger_match.group(1))
             action_text = trigger_match.group(2)
         else:
-            reverse_trigger = re.match(r"^(.+?)\s+when\s+(.+)$", clean, re.I)
-            if reverse_trigger and re.match(
-                rf"^(?:{ACTION_PATTERN})\b", reverse_trigger.group(1), re.I
-            ):
-                trigger = self._sentence(reverse_trigger.group(2))
-                action_text = reverse_trigger.group(1)
+            inline_action_trigger = re.match(
+                rf"^(?:whenever|when|every time|once)\s+(.+?)\s+((?:{ACTION_PATTERN})\b.+)$",
+                clean,
+                re.I,
+            )
+            if inline_action_trigger:
+                trigger = self._sentence(inline_action_trigger.group(1))
+                action_text = inline_action_trigger.group(2)
             else:
-                schedule_prefix = re.match(
-                    r"^(?:every|each)\s+(?:morning|hour|day|weekday|week|month)\s*,?\s*(.+)$",
-                    clean,
-                    re.I,
-                )
-                candidate = schedule_prefix.group(1) if schedule_prefix else clean
-                imperative = re.match(
-                    rf"^(.+?)\s+and\s+((?:{ACTION_PATTERN})\b.+)$",
-                    candidate,
-                    re.I,
-                )
-                if imperative and self._looks_like_trigger(imperative.group(1)):
-                    trigger = self._sentence(imperative.group(1))
-                    action_text = imperative.group(2)
+                reverse_trigger = re.match(r"^(.+?)\s+when\s+(.+)$", clean, re.I)
+                if reverse_trigger and re.match(
+                    rf"^(?:{ACTION_PATTERN})\b", reverse_trigger.group(1), re.I
+                ):
+                    trigger = self._sentence(reverse_trigger.group(2))
+                    action_text = reverse_trigger.group(1)
                 else:
-                    parts = re.split(r",\s*", candidate, maxsplit=1)
-                    if re.match(rf"^(?:{ACTION_PATTERN})\b", candidate, re.I):
-                        trigger = "Manual request"
-                        action_text = candidate
+                    schedule_prefix = re.match(
+                        r"^(?:every|each)\s+(?:morning|hour|day|weekday|week|month)\s*,?\s*(.+)$",
+                        clean,
+                        re.I,
+                    )
+                    candidate = schedule_prefix.group(1) if schedule_prefix else clean
+                    imperative = re.match(
+                        rf"^(.+?)\s+and\s+((?:{ACTION_PATTERN})\b.+)$",
+                        candidate,
+                        re.I,
+                    )
+                    if imperative and self._looks_like_trigger(imperative.group(1)):
+                        trigger = self._sentence(imperative.group(1))
+                        action_text = imperative.group(2)
                     else:
-                        trigger = self._sentence(parts[0])
-                        action_text = parts[1] if len(parts) > 1 else ""
+                        parts = re.split(r",\s*", candidate, maxsplit=1)
+                        if re.match(rf"^(?:{ACTION_PATTERN})\b", candidate, re.I):
+                            trigger = "Manual request"
+                            action_text = candidate
+                        else:
+                            trigger = self._sentence(parts[0])
+                            action_text = parts[1] if len(parts) > 1 else ""
 
         task_parts = re.split(
             rf",\s*|\s+and\s+(?=(?:{ACTION_PATTERN})\b)",
@@ -312,6 +322,22 @@ class WorkflowIntelligenceEngine:
                 )
                 node.description = (
                     "Create a Notion page containing the email sender, subject, date, and body"
+                )
+            if node_type == "calendar_event_create" and has_email_reference(
+                extracted.trigger
+            ):
+                node.config.update(
+                    {
+                        "summary_template": "Email: {{subject}}",
+                        "description_template": (
+                            "From: {{from}}\n"
+                            "Date: {{date}}\n\n"
+                            "{{body}}"
+                        ),
+                    }
+                )
+                node.description = (
+                    "Create a Google Calendar event from the matching email"
                 )
             nodes.append(node)
 
@@ -657,6 +683,8 @@ class WorkflowIntelligenceEngine:
         search_text = self._email_search_text(extracted.trigger)
         if "task_create" in task_types and search_text:
             return f"{search_text.title()} Email Tasks"
+        if "calendar_event_create" in task_types:
+            return "Google Calendar Event Automation"
         names = {
             "lead_management": "Customer Lead Management",
             "support_triage": "Support Request Triage",
@@ -706,6 +734,11 @@ class WorkflowIntelligenceEngine:
             return "notion_create_page"
         if "teams" in lowered:
             return "teams_message"
+        if (
+            ("calendar" in lowered or "event" in lowered)
+            and re.search(r"\b(?:create|add|schedule|make|set)\b", lowered)
+        ):
+            return "calendar_event_create"
         if "reminder" in lowered or "remind" in lowered:
             return "reminder_create"
         if "task" in lowered:
@@ -724,6 +757,7 @@ class WorkflowIntelligenceEngine:
             "crm_update": "Update HubSpot CRM",
             "email_send": "Send Follow-up Email",
             "task_create": "Create Task",
+            "calendar_event_create": "Create Calendar Event",
             "notion_create_page": "Create Notion Page",
             "teams_message": "Notify Microsoft Teams",
             "reminder_create": "Create Reminder",
@@ -770,6 +804,7 @@ class WorkflowIntelligenceEngine:
             "notion": ("api_token",),
             "jira": ("base_url", "email", "api_token", "project_key"),
             "hubspot": ("private_app_token",),
+            "google_calendar": ("service_account_json", "calendar_id"),
         }.get(provider, ())
         connected = bool(required) and all(config.get(field) for field in required)
         if provider == "notion":

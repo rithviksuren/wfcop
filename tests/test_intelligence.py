@@ -147,6 +147,42 @@ def test_mail_related_to_topic_becomes_gmail_search_filter_and_task(tmp_path):
     }
 
 
+def test_mail_to_task_request_recommends_email_task_workflow_first(tmp_path):
+    engine, _ = build_engine(tmp_path)
+
+    analysis = engine.analyze(
+        "when i get a mail related to job create a new task in the task section"
+    )
+
+    assert analysis.recommendations[0].id == "email-follow-up-tasks"
+    assert analysis.recommendations[0].match_score > analysis.recommendations[1].match_score
+    assert [node.type for node in analysis.proposed_workflow.nodes] == [
+        "gmail_trigger",
+        "filter_condition",
+        "task_create",
+    ]
+
+
+def test_mail_to_google_calendar_event_is_supported(tmp_path):
+    engine, _ = build_engine(tmp_path)
+
+    analysis = engine.analyze(
+        "when i get a mail related to job create a new event in google calendar"
+    )
+
+    assert analysis.unsupported_tasks == []
+    assert analysis.intent.apps == ["Gmail", "Google Calendar"]
+    assert analysis.missing_integrations == ["Gmail", "Google Calendar"]
+    assert [node.type for node in analysis.proposed_workflow.nodes] == [
+        "gmail_trigger",
+        "filter_condition",
+        "calendar_event_create",
+    ]
+    calendar = analysis.proposed_workflow.nodes[2]
+    assert calendar.config["summary_template"] == "Email: {{subject}}"
+    assert "{{body}}" in calendar.config["description_template"]
+
+
 def test_topic_related_mail_uses_the_topic_as_the_search_value(tmp_path):
     engine, _ = build_engine(tmp_path)
 

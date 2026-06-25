@@ -28,6 +28,19 @@ NODE_CATALOG: dict[str, NodeDefinition] = {
         required_config=("calendar_id", "lookahead_minutes"),
         defaults={"calendar_id": "primary", "lookahead_minutes": 60},
     ),
+    "calendar_event_create": NodeDefinition(
+        type="calendar_event_create",
+        description="Create a Google Calendar event",
+        required_config=("calendar_id", "summary_template"),
+        defaults={
+            "calendar_id": "primary",
+            "summary_template": "New event: {{subject}}",
+            "description_template": "{{body}}",
+            "start_datetime_template": "",
+            "end_datetime_template": "",
+            "timezone": "UTC",
+        },
+    ),
     "slack_message": NodeDefinition(
         type="slack_message",
         description="Send a Slack message",

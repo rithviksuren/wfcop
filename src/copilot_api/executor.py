@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import email
 import base64
+import datetime as dt
 import imaplib
 import json
 import os
 import re
 import smtplib
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from email.header import decode_header, make_header
@@ -109,6 +112,67 @@ class WorkflowExecutor:
                 "Calendar execution needs an event in the run input. Live Google Calendar credentials are not configured."
             )
         return NodeExecution(output={**event, "triggered": True, "source": "manual input"})
+
+    def _execute_calendar_event_create(
+        self, node: WorkflowNode, payload: dict[str, Any], **_: Any
+    ) -> NodeExecution:
+        integration = self.repository.get_integration("google_calendar")
+        service_account_json = integration.get("service_account_json") or os.getenv(
+            "GOOGLE_CALENDAR_SERVICE_ACCOUNT_JSON"
+        )
+        if not service_account_json:
+            raise WorkflowExecutionError(
+                "Google Calendar is not connected. Open Integrations and add a service account JSON."
+            )
+        calendar_id = (
+            node.config.get("calendar_id")
+            if node.config.get("calendar_id") not in (None, "", "primary", "default")
+            else integration.get("calendar_id")
+            or os.getenv("GOOGLE_CALENDAR_ID")
+            or "primary"
+        )
+        summary = self._render_template(
+            str(node.config.get("summary_template", "New event")), payload
+        )
+        description = self._render_template(
+            str(node.config.get("description_template", "")), payload
+        )
+        timezone_name = str(node.config.get("timezone", "UTC") or "UTC")
+        start_text = self._render_template(
+            str(node.config.get("start_datetime_template", "")), payload
+        )
+        end_text = self._render_template(
+            str(node.config.get("end_datetime_template", "")), payload
+        )
+        start_at, end_at = self._calendar_event_window(start_text, end_text)
+        token = self._google_service_account_access_token(
+            service_account_json,
+            "https://www.googleapis.com/auth/calendar.events",
+        )
+        event_payload = {
+            "summary": summary or "New workflow event",
+            "description": description,
+            "start": {"dateTime": start_at.isoformat(), "timeZone": timezone_name},
+            "end": {"dateTime": end_at.isoformat(), "timeZone": timezone_name},
+        }
+        result = self._post_json(
+            "https://www.googleapis.com/calendar/v3/calendars/"
+            f"{urllib.parse.quote(str(calendar_id), safe='')}/events",
+            event_payload,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        return NodeExecution(
+            output={
+                **payload,
+                "created_calendar_event": {
+                    "id": result.get("id"),
+                    "html_link": result.get("htmlLink"),
+                    "summary": event_payload["summary"],
+                    "start": event_payload["start"]["dateTime"],
+                    "end": event_payload["end"]["dateTime"],
+                },
+            }
+        )
 
     def _execute_webhook(self, node: WorkflowNode, payload: dict[str, Any], **_: Any) -> NodeExecution:
         if not payload:
@@ -726,6 +790,130 @@ class WorkflowExecutor:
             f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-"
             f"{raw[16:20]}-{raw[20:]}"
         )
+
+    def _calendar_event_window(
+        self,
+        start_text: str,
+        end_text: str,
+    ) -> tuple[dt.datetime, dt.datetime]:
+        start = self._parse_datetime(start_text) if start_text else None
+        end = self._parse_datetime(end_text) if end_text else None
+        if start is None:
+            start = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+        if end is None or end <= start:
+            end = start + dt.timedelta(hours=1)
+        return start, end
+
+    def _parse_datetime(self, value: str) -> dt.datetime | None:
+        clean = value.strip()
+        if not clean:
+            return None
+        if clean.endswith("Z"):
+            clean = clean[:-1] + "+00:00"
+        try:
+            parsed = dt.datetime.fromisoformat(clean)
+        except ValueError as exc:
+            raise WorkflowExecutionError(
+                "Google Calendar event times must be ISO datetimes, for example "
+                "2026-06-25T15:00:00+05:30."
+            ) from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed
+
+    def _google_service_account_access_token(
+        self,
+        service_account_json: str,
+        scope: str,
+    ) -> str:
+        try:
+            credentials = json.loads(service_account_json)
+        except json.JSONDecodeError as exc:
+            raise WorkflowExecutionError(
+                "The saved Google Calendar service account JSON is not valid JSON."
+            ) from exc
+        client_email = credentials.get("client_email")
+        private_key = credentials.get("private_key")
+        token_uri = credentials.get("token_uri") or "https://oauth2.googleapis.com/token"
+        if not client_email or not private_key:
+            raise WorkflowExecutionError(
+                "The Google Calendar service account JSON must include client_email and private_key."
+            )
+        now = int(time.time())
+        assertion = self._sign_google_jwt(
+            {
+                "alg": "RS256",
+                "typ": "JWT",
+            },
+            {
+                "iss": client_email,
+                "scope": scope,
+                "aud": token_uri,
+                "iat": now,
+                "exp": now + 3600,
+            },
+            str(private_key),
+        )
+        request = urllib.request.Request(
+            str(token_uri),
+            data=urllib.parse.urlencode(
+                {
+                    "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                    "assertion": assertion,
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise WorkflowExecutionError(
+                f"Google Calendar authentication failed with HTTP {exc.code}: {detail[:300]}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise WorkflowExecutionError(f"Google Calendar authentication failed: {exc}") from exc
+        token = body.get("access_token")
+        if not token:
+            raise WorkflowExecutionError("Google Calendar did not return an access token.")
+        return str(token)
+
+    def _sign_google_jwt(
+        self,
+        header: dict[str, Any],
+        claims: dict[str, Any],
+        private_key: str,
+    ) -> str:
+        try:
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import padding
+        except ImportError as exc:
+            raise WorkflowExecutionError(
+                "Google Calendar event creation requires the cryptography package. "
+                "Install project dependencies, then run the workflow again."
+            ) from exc
+
+        def encode(part: dict[str, Any] | bytes) -> str:
+            raw = part if isinstance(part, bytes) else json.dumps(
+                part,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+        signing_input = f"{encode(header)}.{encode(claims)}".encode("ascii")
+        try:
+            key = serialization.load_pem_private_key(
+                private_key.encode("utf-8"),
+                password=None,
+            )
+            signature = key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+        except (TypeError, ValueError) as exc:
+            raise WorkflowExecutionError(
+                "The Google Calendar service account private_key could not be loaded."
+            ) from exc
+        return f"{signing_input.decode('ascii')}.{encode(signature)}"
 
     def _post_json(
         self, url: str, payload: dict[str, Any], headers: dict[str, str] | None = None

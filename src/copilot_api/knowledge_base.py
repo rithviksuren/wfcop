@@ -131,13 +131,35 @@ class WorkflowKnowledgeBase:
             )
             overlap = len(query_tokens & template_tokens) / max(1, len(query_tokens))
             type_bonus = 0.3 if intent.workflow_type in template.workflow_types else 0
-            industry_bonus = 0.2 if intent.industry in template.industries else 0
+            industry_bonus = (
+                0.2
+                if intent.industry != "general" and intent.industry in template.industries
+                else 0.05
+                if intent.industry == "general" and "general" in template.industries
+                else 0
+            )
             requested_apps = {app.lower() for app in intent.apps}
             template_apps = {app.lower() for app in template.apps}
-            app_bonus = 0.3 * (
+            app_recall_bonus = 0.2 * (
                 len(requested_apps & template_apps) / max(1, len(requested_apps))
             )
-            score = min(1.0, overlap + type_bonus + industry_bonus + app_bonus)
+            app_precision_bonus = 0.15 * (
+                len(requested_apps & template_apps) / max(1, len(template_apps))
+            )
+            if requested_apps == template_apps:
+                app_precision_bonus += 0.05
+            task_bonus = 0.2 if self._task_match(query_tokens, template_tokens) else 0
+            trigger_bonus = 0.15 if self._trigger_match(query_tokens, template) else 0
+            score = min(
+                1.0,
+                overlap
+                + type_bonus
+                + industry_bonus
+                + app_recall_bonus
+                + app_precision_bonus
+                + task_bonus
+                + trigger_bonus,
+            )
             reason_parts = []
             if type_bonus:
                 reason_parts.append("same workflow type")
@@ -178,3 +200,16 @@ class WorkflowKnowledgeBase:
             for token in re.findall(r"[a-z0-9]+", text.lower())
             if len(token) > 1 and token not in stop_words
         }
+
+    def _task_match(self, query_tokens: set[str], template_tokens: set[str]) -> bool:
+        task_terms = {"task", "tasks", "ticket", "tickets", "reminder", "page"}
+        return bool(query_tokens & template_tokens & task_terms)
+
+    def _trigger_match(self, query_tokens: set[str], template: ProvenWorkflow) -> bool:
+        trigger_groups = (
+            {"email", "emails", "mail", "mails", "inbox", "gmail"},
+            {"form", "submission", "lead", "customer"},
+            {"calendar", "event", "meeting"},
+        )
+        template_tokens = self._tokens(template.trigger)
+        return any(query_tokens & group and template_tokens & group for group in trigger_groups)

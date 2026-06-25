@@ -619,6 +619,7 @@ class CopilotService:
                 "gmail_trigger",
                 "filter_condition",
                 "notion_create_page",
+                "calendar_event_create",
             }:
                 explicit_config = expected_node.config
             else:
@@ -851,6 +852,10 @@ class CopilotService:
         if node.type == "calendar_event_trigger":
             minutes = config.get("lookahead_minutes", 60)
             return f"Google Calendar checks for events in the next {minutes} minutes."
+
+        if node.type == "calendar_event_create":
+            summary = str(config.get("summary_template", "New event"))
+            return f'It creates a Google Calendar event titled "{summary}".'
 
         if node.type == "reminder_create":
             message = str(config.get("message_template", "Upcoming event"))
